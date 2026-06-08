@@ -11,11 +11,11 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-load_dotenv()
+load_dotenv(override=True)
 
 client = OpenAI(
-    base_url=os.getenv("NVIDIA_BASE_URL"),
-    api_key=os.getenv("NVIDIA_API_KEY"),
+    base_url=os.getenv("OPENROUTER_BASE_URL"),
+    api_key=os.getenv("OPENROUTER_API_KEY"),
 )
 
 
@@ -46,7 +46,7 @@ def run_bash(command: str) -> str:
         return f"Error: {str(e)}"
 
 
-model = os.getenv("NVIDIA_MODEL")
+model = os.getenv("OPENROUTER_MODEL")
 
 TOOLS = [
     {
@@ -70,16 +70,25 @@ def agent_loop(messages):
             tool_choice="auto",
         )
         msg = resp.choices[0].message
-        messages.append(msg)
+        messages.append(msg.model_dump(exclude_none=True))
+        # messages.append(msg) 传的是对象,不是 dict(line 73)
+        # — 官方 SDK 能接受,但第三方端点(NVIDIA/OpenRouter)对回传对象的序列化偶尔不稳
 
         if not msg.tool_calls:
             print(f"[assistant] {msg.content}")
             return msg.content
 
         for tc in msg.tool_calls:
-            args = BashArgs.model_validate_json(tc.function.arguments)
-            print(f"[tool call] {tc.function.name} with args: {args}")
-            result = run_bash(args.command)
+            if tc.function.name != "bash":
+                result = f"Error: unknown tool '{tc.function.name}'"
+            else:
+                try:
+                    args = BashArgs.model_validate_json(tc.function.arguments)
+                except Exception as e:
+                    result = f"Error: invalid bash arguments - {str(e)}"
+                else:
+                    print(f"[tool call] {tc.function.name} with args: {args}")
+                    result = run_bash(args.command)
             messages.append(
                 {
                     "role": "tool",
@@ -87,7 +96,8 @@ def agent_loop(messages):
                     "content": result,
                 }
             )
-            print(f"[tool result] {result}")
+            print(f"[tool result] {result[:200]}...")  # 只打印前200字符
+    print("[已达最大轮次,中止]")
 
 
 if __name__ == "__main__":
