@@ -1,12 +1,7 @@
-# examples/03_multi_tool_loop.py
-# 目标：在 02_bash_loop.py 基础上，把单 bash 升级为 5 个工具的 dispatch 结构
-# OpenAI 格式 + pydantic + 单一数据源 TOOL_REGISTRY
-# 红线：不用 eval；每个 tool_call 必须 append role:tool；参数必须 pydantic 校验；
-#       file 类工具必须过 safe_path；dispatch 用 registry.get() 兜底
-
 import os
 import subprocess
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -16,6 +11,12 @@ from pydantic import BaseModel, Field
 WORKDIR = Path.cwd()  # 改为当前工作目录，更通用
 
 load_dotenv(override=True)
+
+SYSTEM = (
+    f"You are a coding agent at {WORKDIR}. "
+    "Before starting any multi-step task, use todo_write to plan your steps. "
+    "Update status as you go."
+)
 
 client = OpenAI(
     base_url=os.getenv("BASE_URL"),
@@ -33,30 +34,7 @@ DENY_LIST = [
     "dd if=",
     "> /dev/sda",
 ]
-
-PERMISSION_RULES = [
-    {
-        "tools": ["write_file", "edit_file"],
-        "check": lambda args: (
-            not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR)
-        ),
-        "message": "Writing outside workspace",
-    },
-    {
-        "tools": ["bash"],
-        "check": lambda args: any(
-            kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]
-        ),
-        "message": "Potentially destructive command",
-    },
-]
-
-
-def ask_user(name: str, args: dict, reason: str) -> str:
-    print(f"\n⚠  {reason}")
-    print(f"   Tool: {name}({args})")
-    choice = input("   Allow? [y/N] ").strip().lower()
-    return "allow" if choice in ("y", "yes") else "deny"
+DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
 
 
 class BashArgs(BaseModel):
@@ -81,6 +59,19 @@ class EditFileArgs(BaseModel):
 
 class GlobArgs(BaseModel):
     pattern: str = Field(..., description="glob pattern to search for files")
+
+
+class TodoItem(BaseModel):
+    content: str = Field(..., description="the content of the todo item")
+    status: Literal["pending", "in_progress", "completed"] = Field(
+        ..., description="the status of the todo item"
+    )
+
+
+class TodoWriteArgs(BaseModel):
+    todos: list[TodoItem] = Field(
+        ..., description="list of todo items with content and status"
+    )
 
 
 def safe_path(p: str) -> Path:
@@ -159,12 +150,35 @@ def run_glob(pattern: str) -> str:
         return f"Error: {str(e)}"
 
 
+def run_todo_write(todos: list) -> str:
+    global CURRENT_TODOS
+    CURRENT_TODOS = todos
+    lines = ["\n\033[33m## Current Tasks\033[0m"]
+    for t in CURRENT_TODOS:
+        icon = {
+            "pending": " ",
+            "in_progress": "\033[36m▸\033[0m",
+            "completed": "\033[32m✓\033[0m",
+        }[t["status"]]
+        lines.append(f"  [{icon}] {t['content']}")
+    print("\n".join(lines))
+    return f"Updated {len(CURRENT_TODOS)} tasks"
+
+
 TOOL_REGISTRY = {
     "bash": ("Run a shell command.", BashArgs, run_bash),
     "read_file": ("Read file contents.", ReadFileArgs, run_read),
     "write_file": ("Write content to a file.", WriteFileArgs, run_write),
     "edit_file": ("Replace exact text in a file once.", EditFileArgs, run_edit),
     "glob": ("Find files matching a glob pattern.", GlobArgs, run_glob),
+    "todo_write": (
+        "Create and manage a task list for your current coding session. "
+        "IMPORTANT: this tool REPLACES the entire task list on every call. "
+        "Always pass the COMPLETE list of ALL tasks (including unchanged ones) "
+        "with their current status — never send only the tasks you just updated.",
+        TodoWriteArgs,
+        run_todo_write,
+    ),
 }
 
 model = os.getenv("MODEL")
@@ -181,27 +195,94 @@ TOOLS = [
     for name, (desc, args_model, func) in TOOL_REGISTRY.items()
 ]
 
+HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []}
 
-def check_permission(name: str, args: dict) -> bool:
+
+def register_hook(event: str, callback):
+    HOOKS[event].append(callback)
+
+
+def trigger_hook(event: str, *args):
+    for callback in HOOKS[event]:
+        result = callback(*args)
+        if result is not None:
+            return result
+    return None
+
+
+def permission_hook(name, args):
     if name == "bash":
-        command = args.get("command", "")
         for pattern in DENY_LIST:
-            if pattern in command:
-                print(f"\n⛔ Blocked: '{pattern}' is on the deny list")
-                return False
+            if pattern in args.get("command", ""):
+                print(f"\n\033[31m⛔ Blocked: '{pattern}'\033[0m")
+                return "Permission denied by deny list"
+        for kw in DESTRUCTIVE:
+            if kw in args.get("command", ""):
+                print("\n\033[33m⚠  Potentially destructive command\033[0m")
+                print(f"   Tool: {name}({args})")
+                choice = input("   Allow? [y/N] ").strip().lower()
+                if choice not in ("y", "yes"):
+                    return "Permission denied by user"
+    if name in ("write_file", "edit_file"):
+        path = args.get("path", "")
+        if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
+            print("\n\033[33m⚠  Writing outside workspace\033[0m")
+            print(f"   Tool: {name}({args})")
+            choice = input("   Allow? [y/N] ").strip().lower()
+            if choice not in ("y", "yes"):
+                return "Permission denied by user"
+    return None
 
-    for rule in PERMISSION_RULES:
-        if name in rule["tools"] and rule["check"](args):
-            decision = ask_user(name, args, rule["message"])
-            if decision == "deny":
-                return False
 
-    return True
+def log_hook(name, args):
+    """PreToolUse: log every tool call."""
+    args_preview = str(list(args.values())[:2])[:60]
+    print(f"\033[90m[HOOK] {name}({args_preview})\033[0m")
+    return None
+
+
+def large_output_hook(name, output):
+    """PostToolUse: warn on large output."""
+    if len(str(output)) > 100000:
+        print(
+            f"\033[33m[HOOK] ⚠ Large output from {name}: {len(str(output))} chars\033[0m"
+        )
+    return None
+
+
+# UserPromptSubmit hook: log user input before it reaches the LLM
+def context_inject_hook(query: str):
+    print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
+    return None
+    # return f"工作目录: {WORKDIR}\n用户输入: {query}"
+
+
+# Stop hook: print summary when loop is about to exit
+def summary_hook(messages: list):
+    tool_count = sum(1 for m in messages if m.get("role") == "tool")
+    print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
+    return None
+
+
+register_hook("UserPromptSubmit", context_inject_hook)
+register_hook("PreToolUse", log_hook)
+register_hook("PreToolUse", permission_hook)
+register_hook("PostToolUse", large_output_hook)
+register_hook("Stop", summary_hook)
+
+
+rounds_since_todo = 0
 
 
 def agent_loop(messages):
+    global rounds_since_todo
     max_turns = 25
     for trun in range(max_turns):
+        if rounds_since_todo >= 3 and messages:
+            messages.append(
+                {"role": "user", "content": "<reminder>Update your todos.</reminder>"}
+            )
+            rounds_since_todo = 0
         resp = client.chat.completions.create(
             model=model,
             messages=messages,
@@ -212,9 +293,14 @@ def agent_loop(messages):
         messages.append(msg.model_dump(exclude_none=True))
 
         if not msg.tool_calls:
+            force = trigger_hook("Stop", messages)
+            if force is not None:
+                messages.append({"role": "user", "content": force})
+                continue
             print(f"[assistant] {msg.content}")
             return msg.content
 
+        rounds_since_todo += 1
         for tc in msg.tool_calls:
             entry = TOOL_REGISTRY.get(tc.function.name)
             if not entry:
@@ -227,12 +313,16 @@ def agent_loop(messages):
                     result = f"Error: invalid arguments for tool '{tc.function.name}' - {str(e)}"
                 else:
                     print(f"[tool call] {tc.function.name} with args: {args}")
-                    # result = handler(**args.model_dump())
                     arg_dict = args.model_dump()
-                    if not check_permission(tc.function.name, arg_dict):
-                        result = "Permission denied."
+                    blocked = trigger_hook("PreToolUse", tc.function.name, arg_dict)
+                    if blocked is not None:
+                        result = blocked
                     else:
                         result = handler(**arg_dict)
+                        trigger_hook("PostToolUse", tc.function.name, result)
+                        if tc.function.name == "todo_write":
+                            rounds_since_todo = 0
+
             messages.append(
                 {
                     "role": "tool",
@@ -247,10 +337,9 @@ def agent_loop(messages):
 
 
 if __name__ == "__main__":
-    print("03: Multi Tool Loop (5 tools via registry)")
     print("输入问题，回车发送。输入 q 退出。\n")
 
-    messages = []
+    messages = [{"role": "system", "content": SYSTEM}]
     while True:
         try:
             user_input = input("You: ")
@@ -258,5 +347,11 @@ if __name__ == "__main__":
             break
         if user_input.strip().lower() in ["q", "quit", "exit"]:
             break
-        messages.append({"role": "user", "content": user_input})
+        injected = trigger_hook("UserPromptSubmit", user_input)
+        messages.append(
+            {
+                "role": "user",
+                "content": injected if injected is not None else user_input,
+            }
+        )
         agent_loop(messages)
