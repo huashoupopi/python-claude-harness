@@ -12,3 +12,19 @@ wheels/
 
 .env
 
+# pytest 缓存
+.pytest_cache/
+
+# === Harness 运行时产物:每次跑都会重新生成,不进仓 ===
+# 任务系统 / 定时任务 / 团队收件箱 / worktree 隔离目录
+.tasks/
+.scheduled_tasks.json
+.mailboxes/
+.worktrees/
+# 记忆系统 / 轨迹归档 / 后台任务输出
+.memory/
+.transcripts/
+.task_outputs/
+# mini-bench 的历次跑分结果(题库 bench/tasks/ 要进仓,成绩单不进)
+bench/runs/
+
