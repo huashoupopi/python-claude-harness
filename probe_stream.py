@@ -42,7 +42,6 @@ def build_message(text, tool_calls):
     """
     msg = {"role": "assistant", "content": text}
 
-    # ↓↓↓ 你写这段 ↓↓↓
     # 如果 tool_calls 非空:
     #   ① 把字典的值【按 key 排序】取出来
     #   ② 每个都 .model_dump(exclude={"index"})
@@ -51,7 +50,6 @@ def build_message(text, tool_calls):
         msg["tool_calls"] = [
             call.model_dump(exclude={"index"}) for _, call in sorted(tool_calls.items())
         ]
-    # ↑↑↑ 你写这段 ↑↑↑
 
     return msg
 
