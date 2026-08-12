@@ -13,6 +13,7 @@
 运行方式与 21 相同:uv run python examples/22_trunk.py
 """
 
+import argparse
 import json
 import os
 import random
@@ -25,7 +26,7 @@ from collections.abc import Callable
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -49,11 +50,119 @@ MAILBOX_DIR = WORKDIR / ".mailboxes"
 WORKTREES_DIR = WORKDIR / ".worktrees"
 model = os.getenv("NVIDIA_MODEL")
 
+CURRENT_TODOS: list = []
+MAX_GLOB_RESULTS = 200
+
 
 def ensure_dirs():
     """建运行期目录。只在启动时调用——import 本模块不该在 cwd 里造目录。"""
     for d in (MEMORY_DIR, TASKS_DIR, MAILBOX_DIR, WORKTREES_DIR):
         d.mkdir(exist_ok=True)
+
+
+HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []}
+
+
+def register_hook(event: str, callback):
+    HOOKS[event].append(callback)
+
+
+def trigger_hook(event: str, *args):
+    for callback in HOOKS[event]:
+        result = callback(*args)
+        if result is not None:
+            return result
+    return None
+
+
+def log_hook(name, args):
+    """PreToolUse: log every tool call."""
+    args_preview = str(list(args.values())[:2])[:60]
+    print(f"\033[90m[HOOK] {name}({args_preview})\033[0m")
+
+
+def large_output_hook(name, output):
+    """PostToolUse: warn on large output."""
+    if len(str(output)) > 100000:
+        print(
+            f"\033[33m[HOOK] ⚠ Large output from {name}: {len(str(output))} chars\033[0m"
+        )
+
+
+# UserPromptSubmit hook: log user input before it reaches the LLM
+def context_inject_hook(query: str):
+    print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
+    # return f"工作目录: {WORKDIR}\n用户输入: {query}"
+
+
+# Stop hook: print summary when loop is about to exit
+def summary_hook(messages: list):
+    tool_count = sum(1 for m in messages if m.get("role") == "tool")
+    print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
+
+
+DENY_LIST = [
+    "rm -rf /",
+    "sudo",
+    "shutdown",
+    "reboot",
+    "mkfs",
+    "dd if=",
+    "> /dev/sda",
+]
+DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
+
+
+def require_approval(name: str, args: dict, reason: str) -> str | None:
+    """要求人工批准。返回 None=放行,字符串=拒绝原因(与 hook 契约一致)。
+
+    安全约定(fail closed):【问不到人 = 没得到许可 = 拒绝】。
+
+    两道防线缺一不可:
+      isatty()  挡住「读到了但那不是人的回答」—— 管道/重定向会读到数据流里的下一行
+      try/except 挡住「压根读不到」—— /dev/null 抛 EOFError、Ctrl-C 抛 KeyboardInterrupt
+    """
+    if not sys.stdin.isatty():
+        return f"Permission denied: non-interactive environment, cannot confirm {reason}"
+
+    # 确定要问人了,才打印给人看的东西
+    print(f"\n\033[33m⚠  {reason}\033[0m")
+    print(f"   Tool: {name}({args})")
+    try:
+        choice = input("   Allow? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return "Permission denied: no input available (EOF/interrupt)"
+    # [y/N] 大写 N = 直接回车等于拒绝
+    return None if choice in ("y", "yes") else "Permission denied by user"
+
+
+def permission_hook(name, args):
+    if name == "bash":
+        for pattern in DENY_LIST:
+            if pattern in args.get("command", ""):
+                print(f"\n\033[31m⛔ Blocked: '{pattern}'\033[0m")
+                return "Permission denied by deny list"
+        for kw in DESTRUCTIVE:
+            if kw in args.get("command", ""):
+                denied = require_approval(
+                    name, args, "potentially destructive command"
+                )
+                if denied:
+                    return denied
+    if name in ("write_file", "edit_file"):
+        path = args.get("path", "")
+        if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
+            denied = require_approval(name, args, "writing outside workspace")
+            if denied:
+                return denied
+    return None
+
+
+register_hook("UserPromptSubmit", context_inject_hook)
+register_hook("PreToolUse", log_hook)
+register_hook("PreToolUse", permission_hook)
+register_hook("PostToolUse", large_output_hook)
+register_hook("Stop", summary_hook)
 
 
 class TaskStatus(StrEnum):
@@ -1103,6 +1212,40 @@ class BashArgs(BaseModel):
     )
 
 
+class ReadFileArgs(BaseModel):
+    path: str = Field(..., description="the path of the file to read")
+    limit: int | None = Field(None, description="maximum number of lines to read")
+
+
+class WriteFileArgs(BaseModel):
+    path: str = Field(..., description="path to write the file to")
+    content: str = Field(..., description="content to write into the file")
+
+
+class EditFileArgs(BaseModel):
+    path: str = Field(..., description="path to the file to edit")
+    old_text: str = Field(..., description="exact text to find and replace")
+    new_text: str = Field(..., description="text to replace the old_text with")
+
+
+class GlobArgs(BaseModel):
+    pattern: str = Field(..., description="glob pattern to search for files")
+    limit: int | None = Field(None, description="maximum number of files to return")
+
+
+class TodoItem(BaseModel):
+    content: str = Field(..., description="the content of the todo item")
+    status: Literal["pending", "in_progress", "completed"] = Field(
+        ..., description="the status of the todo item"
+    )
+
+
+class TodoWriteArgs(BaseModel):
+    todos: list[TodoItem] = Field(
+        ..., description="list of todo items with content and status"
+    )
+
+
 class CreateTaskArgs(BaseModel):
     subject: str = Field(..., description="the subject of the task")
     description: str = Field("", description="the description of the task")
@@ -1196,6 +1339,87 @@ def run_bash(
         return "Error: command timed out"
     except Exception as e:
         return f"Error: {e!s}"
+
+
+def safe_path(p: str) -> Path:
+    path = (WORKDIR / p).resolve()
+    if not path.is_relative_to(WORKDIR):
+        raise ValueError(f"Path escapes workspace: {p}")
+    return path
+
+
+def run_read(path: str, limit: int | None = None) -> str:
+    try:
+        file_path = safe_path(path)
+        lines = file_path.read_text().splitlines()
+        if limit is not None and limit < len(lines):
+            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e!s}"
+
+
+def run_write(path: str, content: str) -> str:
+    try:
+        file_path = safe_path(path)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content)
+        return f"Wrote {len(content)} bytes to {path}"
+    except Exception as e:
+        return f"Error: {e!s}"
+
+
+def run_edit(path: str, old_text: str, new_text: str) -> str:
+    try:
+        file_path = safe_path(path)
+        text = file_path.read_text()
+        if old_text not in text:
+            return f"Error: text not found in {path}"
+        file_path.write_text(text.replace(old_text, new_text, 1))
+        return f"Edited {path}"
+    except Exception as e:
+        return f"Error: {e!s}"
+
+
+def run_glob(pattern: str, limit: int | None = None) -> str:
+    import glob as g
+
+    try:
+        results = []
+        for match in sorted(g.glob(pattern, root_dir=WORKDIR, recursive=True)):
+            resolved = (WORKDIR / match).resolve()
+            # is_relative_to 把「等于」也算「在里面」,所以自引用路径(../<工作目录名>)
+            # 会漏网;显式排除 WORKDIR 自身。
+            if resolved == WORKDIR or not resolved.is_relative_to(WORKDIR):
+                continue
+            # 输出统一成相对 WORKDIR 的干净路径,避免 ../ 开头的形式流到下游
+            results.append(str(resolved.relative_to(WORKDIR)))
+        if limit is not None and limit < len(results):
+            results = results[:limit] + [f"... ({len(results) - limit} more matches)"]
+            return "\n".join(results)
+        if len(results) > MAX_GLOB_RESULTS:
+            results = results[:MAX_GLOB_RESULTS] + [
+                f"... ({len(results) - MAX_GLOB_RESULTS} more matches)"
+            ]
+            return "\n".join(results)
+        return "\n".join(results) if results else "(no matches)"
+    except Exception as e:
+        return f"Error: {e!s}"
+
+
+def run_todo_write(todos: list) -> str:
+    global CURRENT_TODOS
+    CURRENT_TODOS = todos
+    lines = ["\n\033[33m## Current Tasks\033[0m"]
+    for t in CURRENT_TODOS:
+        icon = {
+            "pending": " ",
+            "in_progress": "\033[36m▸\033[0m",
+            "completed": "\033[32m✓\033[0m",
+        }[t["status"]]
+        lines.append(f"  [{icon}] {t['content']}")
+    print("\n".join(lines))
+    return f"Updated {len(CURRENT_TODOS)} tasks"
 
 
 def run_create_task(
@@ -1574,6 +1798,18 @@ def builtin(desc: str, args_model: type[BaseModel], handler: Callable) -> ToolEn
 
 TOOL_REGISTRY = {
     "bash": builtin("Run a shell command.", BashArgs, run_bash),
+    "read_file": builtin("Read file contents.", ReadFileArgs, run_read),
+    "write_file": builtin("Write content to a file.", WriteFileArgs, run_write),
+    "edit_file": builtin("Replace exact text in a file once.", EditFileArgs, run_edit),
+    "glob": builtin("Find files matching a glob pattern.", GlobArgs, run_glob),
+    "todo_write": builtin(
+        "Create and manage a task list for your current coding session. "
+        "IMPORTANT: this tool REPLACES the entire task list on every call. "
+        "Always pass the COMPLETE list of ALL tasks (including unchanged ones) "
+        "with their current status — never send only the tasks you just updated.",
+        TodoWriteArgs,
+        run_todo_write,
+    ),
     "create_task": builtin(
         "Create a new task with subject, description, and optional blockedBy list.",
         CreateTaskArgs,
@@ -1957,9 +2193,21 @@ def agent_loop(messages: list, context: dict):
         messages.append(msg)
         calls = [tc for _, tc in sorted(tool_calls.items())]
         if not calls:
+            trigger_hook("Stop", messages)
             return context
         for tc in calls:
             args = json.loads(tc.function.arguments or "{}")
+            blocked = trigger_hook("PreToolUse", tc.function.name, args)
+            if blocked is not None:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": f"[Tool '{tc.function.name}' blocked by hook: {blocked}]",
+                    }
+                )
+                print(f"[tool blocked] {tc.function.name}: {blocked}")
+                continue
             if should_run_background(tc.function.name, args):
                 bg_id = start_background_task(tc, TOOLS_Registry, args)
                 messages.append(
@@ -1975,6 +2223,7 @@ def agent_loop(messages: list, context: dict):
                 continue
 
             result = execute_tool(tc, TOOLS_Registry)
+            trigger_hook("PostToolUse", tc.function.name, result)
             messages.append(
                 {
                     "role": "tool",
@@ -1998,6 +2247,7 @@ def agent_loop(messages: list, context: dict):
         system = assemble_system_prompt(context)
         messages[0] = {**messages[0], "content": system}
     print("达到最大轮次")
+    trigger_hook("Stop", messages)
     return context
 
 
@@ -2015,10 +2265,12 @@ def print_latest_assistant_text(messages: list):
 def run_agent_turn_locked(user_query: str | None = None, cron: bool = False):
     global session_context
     if user_query is not None:
+        trigger_hook("UserPromptSubmit", user_query)
         session_history.append({"role": "user", "content": user_query})
     if cron:
         fired = consume_cron_queue()
         for job in fired:
+            trigger_hook("UserPromptSubmit", job.prompt)
             session_history.append(
                 {"role": "user", "content": f"[Scheduled] {job.prompt}"}
             )
@@ -2058,9 +2310,18 @@ def queue_processor_loop():
 
 def main():
     """启动 agent。原先散在模块顶层的四类副作用全部收在这里。"""
+    parser = argparse.ArgumentParser(description="Run the coding agent.")
+    parser.add_argument(
+        "task", nargs="?", help="Optional initial task to give the agent."
+    )
+    args = parser.parse_args()
     ensure_dirs()
-    start_cron_scheduler()
     init_session()
+    if args.task:
+        with agent_lock:
+            run_agent_turn_locked(args.task)
+        return
+    start_cron_scheduler()
     print("输入一个问题，回车发送。输入q退出。\n")
     threading.Thread(target=queue_processor_loop, daemon=True).start()
     print("  \033[35m[queue processor] started\033[0m")
