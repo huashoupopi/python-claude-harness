@@ -1883,6 +1883,49 @@ def assemble_tools():
     return TOOLS_Registry, TOOLS
 
 
+def accumulate_stream(chunks):
+    final_tool_calls = {}
+    final_text = ""
+    finish_reason = None
+    for chunk in chunks:
+        delta = chunk.choices[0].delta
+        if delta.content:
+            final_text += delta.content
+            print(delta.content, end="", flush=True)
+        for tool_call in delta.tool_calls or []:
+            index = tool_call.index
+            if index not in final_tool_calls:
+                final_tool_calls[index] = tool_call
+            else:
+                final_tool_calls[
+                    index
+                ].function.arguments += tool_call.function.arguments
+        if chunk.choices[0].finish_reason:
+            finish_reason = chunk.choices[0].finish_reason
+
+    return final_text, final_tool_calls, finish_reason
+
+
+def build_message(text, tool_calls):
+    """把累积结果拼成一条 assistant 消息。
+
+    形状必须与非流式的 msg.model_dump(exclude_none=True) 一致,
+    否则塞回 messages 后下一轮请求会 400。
+    """
+    msg = {"role": "assistant", "content": text}
+
+    # 如果 tool_calls 非空:
+    #   ① 把字典的值【按 key 排序】取出来
+    #   ② 每个都 .model_dump(exclude={"index"})
+    #   ③ 结果塞进 msg["tool_calls"]
+    if tool_calls:
+        msg["tool_calls"] = [
+            call.model_dump(exclude={"index"}) for _, call in sorted(tool_calls.items())
+        ]
+
+    return msg
+
+
 def agent_loop(messages: list, context: dict):
     max_turns = 25
     # system = get_system_prompt(context)
@@ -1900,18 +1943,22 @@ def agent_loop(messages: list, context: dict):
                 messages=messages,
                 tools=TOOLS,
                 tool_choice="auto",
+                stream=True,
             )
         except Exception as e:
             messages.append(
                 {"role": "assistant", "content": f"[Error] {type(e).__name__}: {e}"}
             )
             return context
-        msg = reps.choices[0].message
-        messages.append(msg.model_dump(exclude_none=True))
-        if not msg.tool_calls:
-            # print(f"[assistant] {msg.content}")
+        # msg = reps.choices[0].message
+        # messages.append(msg.model_dump(exclude_none=True))
+        text, tool_calls, finish_reason = accumulate_stream(reps)
+        msg = build_message(text, tool_calls)
+        messages.append(msg)
+        calls = [tc for _, tc in sorted(tool_calls.items())]
+        if not calls:
             return context
-        for tc in msg.tool_calls:
+        for tc in calls:
             args = json.loads(tc.function.arguments or "{}")
             if should_run_background(tc.function.name, args):
                 bg_id = start_background_task(tc, TOOLS_Registry, args)
@@ -1945,7 +1992,7 @@ def agent_loop(messages: list, context: dict):
                 f"  \033[32m[inject] {len(bg_notifications)} background "
                 f"notification(s)\033[0m"
             )
-        if any(tc.function.name == "connect_mcp" for tc in msg.tool_calls):
+        if any(tc.function.name == "connect_mcp" for tc in calls):
             TOOLS_Registry, TOOLS = assemble_tools()
         context = update_context(context, messages)
         system = assemble_system_prompt(context)
@@ -1988,7 +2035,7 @@ def run_agent_turn_locked(user_query: str | None = None, cron: bool = False):
         )
         session_history.append({"role": "user", "content": f"[Inbox]\n{inbox_text}"})
         print(f"\n\033[33m[Inbox: {len(inbox_msgs)} messages injected]\033[0m")
-    print_latest_assistant_text(session_history)
+    # print_latest_assistant_text(session_history)
     print()
 
 
