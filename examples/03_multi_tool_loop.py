@@ -18,8 +18,10 @@ WORKDIR = Path.cwd()  # 改为当前工作目录，更通用
 load_dotenv(override=True)
 
 client = OpenAI(
-    base_url=os.getenv("OPENROUTER_BASE_URL"),
-    api_key=os.getenv("OPENROUTER_API_KEY"),
+    base_url=os.getenv("BASE_URL"),
+    api_key=os.getenv("API_KEY"),
+    timeout=60.0,  # 2026-08-11 AI 代改:与 09/10/11 对齐,消融要求四臂 client 配置一致
+    default_headers={"User-Agent": "curl/8.7.1"},  # 同上:网关按 UA 拦截,缺此行请求被 blocked
 )
 
 
@@ -131,7 +133,7 @@ TOOL_REGISTRY = {
     "glob": ("Find files matching a glob pattern.", GlobArgs, run_glob),
 }
 
-model = os.getenv("OPENROUTER_MODEL")
+model = os.getenv("MODEL")
 
 TOOLS = [
     {
