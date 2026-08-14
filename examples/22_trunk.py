@@ -537,7 +537,12 @@ def ensure_dirs():
         TOOL_RESULTS_DIR,
         SKILLS_DIR,
     ):
-        d.mkdir(exist_ok=True)
+        # parents=True 不能省:TOOL_RESULTS_DIR 是 .task_outputs/tool-results 【两层】,
+        # 不建父目录会 FileNotFoundError。在项目根目录跑时一直没炸,是因为
+        # .task_outputs/ 早被 persist_large_output 里的 mkdir(parents=True) 建好了 ——
+        # 换到 bench 的全新考场副本(2026-08-14)才暴露:
+        # 【代码依赖了「当前环境恰好已经有某个东西」】。
+        d.mkdir(parents=True, exist_ok=True)
 
 
 def snip_compact(msgs, max_msgs=50):
@@ -2952,32 +2957,31 @@ background_results: dict[str, str] = {}  # bg_id → output
 background_lock = threading.Lock()
 
 
-def is_slow_operation(tc_name: str, tc_args: dict) -> bool:
-    """Fallback heuristic: commands likely to take > 30s."""
-    if tc_name != "bash":
-        return False
-    cmd = tc_args.get("command", "").lower()
-    slow_keywords = [
-        "install",
-        "build",
-        "test",
-        "deploy",
-        "compile",
-        "docker build",
-        "pip install",
-        "npm install",
-        "cargo build",
-        "pytest",
-        "make",
-    ]
-    return any(kw in cmd for kw in slow_keywords)
-
-
 def should_run_background(tc_name: str, tc_args: dict) -> bool:
-    """Model explicit request takes priority; fallback to heuristic."""
-    if tc_args.get("run_in_background"):
-        return True
-    return is_slow_operation(tc_name, tc_args)
+    """只认模型的显式意图 —— 后台与否由它决定,系统不猜。
+
+    【2026-08-14 删掉启发式 is_slow_operation】
+    原实现按关键词猜「这条命令是不是慢操作」:
+        slow_keywords = ["install","build","test","deploy","compile","pytest","make",...]
+    两个问题:
+      ① 过宽:`cat test.py` 命中 "test",`cat build.md` 命中 "build"(2026-08-11 已记录)
+      ② 🔴 致命:mini-bench 的题目全是「跑测试 → 看结果 → 改代码」,
+         而 pytest 被自动丢后台 → 模型拿到的是占位符不是结果 → 再跑一次 → 又进后台
+         → 实测空转 15 步。【散件时代测不出来:03 根本没有后台任务机制】
+
+    为什么删而不是调关键词:关键词猜测是【设计缺陷】,不是调参问题。
+    docstring 原本就写着 "Model explicit request takes priority" ——
+    模型的显式意图本就该是唯一依据,启发式是多余的兜底。
+    🪝 同族教训:stage-1 归因证明过「系统自动替模型做的决定常常是负担」(todo_write)。
+
+    代价:模型忘了标记 run_in_background 时,慢命令会占住主循环
+        (run_bash 有 timeout=120 兜底,不会永久卡死)。
+
+    📌 TODO(有余力时做,当事人 2026-08-14 点名保留):补一个 wait_for_background 工具,
+       让模型能主动等某个 bg_id 出结果 —— 那才是后台机制的完整形态。
+       现在的形态是「派遣出去就不管了,靠下一轮的 [inject] 撞见」。
+    """
+    return bool(tc_args.get("run_in_background"))
 
 
 def execute_tool(tc, TR) -> str:
