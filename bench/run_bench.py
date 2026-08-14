@@ -28,10 +28,24 @@ TIMEOUT_S = 300
 # ⚠️ 值必须是 str:subprocess 的 env 只收字符串,传 True/None 会 TypeError。
 # ⚠️ 主干对非法值是 fail loud(当场 raise ValueError),所以拼错臂名不会静默
 #    退回默认值跑完一整轮才发现数据全废 —— 这就是那个 fail loud 在买的保险。
+#
+# 【轴式消融】一次只动一个轴,别的固定在主干默认值。
+# 两个轴都动的话 3×3=9 臂,乘上题数与重复次数根本跑不完;而且成绩变了也分不清
+# 是谁的功劳(混淆变量)。两轴共用「全默认」那一格(mem_self == todo_nudge),
+# 所以 3+3-1 = 5 个配置。
+#
+# 📌 每个臂都【显式写全两个变量】,一个都不靠默认值兜底。
+#    理由是 2026-08-14 那个默认值 bug 的延伸:靠默认的话,读 CONFIGS 的人看不出
+#    另一个轴处在什么状态;更糟的是哪天默认值一改,历史数据的含义就跟着变了,
+#    而 results.jsonl 里只记了臂名。—— 实验配置必须自我说明。
 CONFIGS = {
-    "mem_none": {"MEMORY_MODE": "none"},
-    "mem_self": {"MEMORY_MODE": "self"},
-    "mem_official": {"MEMORY_MODE": "official"},
+    # memory 轴(todo 固定在默认 nudge)
+    "mem_none": {"MEMORY_MODE": "none", "TODO_MODE": "nudge"},
+    "mem_self": {"MEMORY_MODE": "self", "TODO_MODE": "nudge"},  # ← 两轴共用的原点
+    "mem_official": {"MEMORY_MODE": "official", "TODO_MODE": "nudge"},
+    # todo 轴(memory 固定在默认 self);todo_nudge 就是上面的 mem_self,不重复跑
+    "todo_none": {"MEMORY_MODE": "self", "TODO_MODE": "none"},
+    "todo_tool": {"MEMORY_MODE": "self", "TODO_MODE": "tool"},
 }
 
 

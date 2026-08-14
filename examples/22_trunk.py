@@ -120,6 +120,13 @@ if MEMORY_MODE not in MEMORY_MODES:
     # 否则 bench 跑完一整轮才发现「消融臂根本没生效」,数据全废。
     raise ValueError(f"MEMORY_MODE={MEMORY_MODE!r} 不合法,只能是 {MEMORY_MODES} 之一")
 
+TODO_MODES = ("none", "tool", "nudge")
+TODO_MODE = os.getenv("TODO_MODE", "nudge")
+if TODO_MODE not in TODO_MODES:
+    # fail loud:配置错了当场炸,不要静默退回默认值 ——
+    # 否则 bench 跑完一整轮才发现「消融臂根本没生效」,数据全废。
+    raise ValueError(f"TODO_MODE={TODO_MODE!r} 不合法,只能是 {TODO_MODES} 之一")
+
 # 【2026-08-14 删除 ESCALATED_MAX_TOKENS = 64000】
 # 13_error_recovery.py 的截断处置是两级:①升档重来(8000→64000,丢掉半截重新生成)
 # ②保留 + 续写。本主干是【流式】的,半截输出已经一个字一个字打到用户屏幕上了,
@@ -2324,7 +2331,7 @@ def spawn_subagent(description: str) -> str:
         messages.append(build_message(text, tool_calls))
         calls = [tc for _, tc in sorted(tool_calls.items())]
         if not calls:
-            print(f"  \033[35m[subagent] done\033[0m")
+            print("  \033[35m[subagent] done\033[0m")
             return text  # ← 只把结论交回主 agent
         for tc in calls:
             args = json.loads(tc.function.arguments or "{}")
@@ -2334,9 +2341,7 @@ def spawn_subagent(description: str) -> str:
                 if blocked is not None
                 else execute_tool(tc, sub_registry)
             )
-            messages.append(
-                {"role": "tool", "tool_call_id": tc.id, "content": result}
-            )
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
     return "[subagent] 达到最大轮次,子任务未完成"
 
 
@@ -2690,6 +2695,8 @@ def assemble_tool_pool() -> dict:
     tools = dict(TOOL_REGISTRY)
     if MEMORY_MODE != "official":
         tools.pop("memory", None)
+    if TODO_MODE == "none":
+        tools.pop("todo_write", None)
     for server_name, mcp_client in mcp_clients.items():
         safe_server = normalize_mcp_name(server_name)
         for tool_def in mcp_client.tools:
@@ -3182,7 +3189,7 @@ def agent_loop(messages: list, context: dict):
         messages[:] = snip_compact(messages)  # L1: trim middle
         messages[:] = micro_compact(messages)  # L2: old result placeholders
         try_compact(messages)  # L4: summarize if too large
-        if rounds_since_todo >= 3 and messages:
+        if TODO_MODE == "nudge" and rounds_since_todo >= 3 and messages:
             messages.append(
                 {"role": "user", "content": "<reminder>Update your todos.</reminder>"}
             )
