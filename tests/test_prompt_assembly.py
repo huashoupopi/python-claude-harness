@@ -147,3 +147,25 @@ def test_prompt_follows_tool_pool_without_staleness(trunk, monkeypatch):
     monkeypatch.setattr(trunk, "TODO_MODE", "none")
     # context 一模一样,只有工具池变了
     assert "todo_write" not in trunk.get_system_prompt(ctx)
+
+
+def test_planning_guidance_follows_todo_switch(trunk, monkeypatch):
+    """🔴 规划引导必须跟着 TODO_MODE 走 —— 系统给的指令要落在系统给的能力范围内。
+
+    2026-08-14:课程 s05_todo_write/code.py 的 SYSTEM 里本来就有
+    "Before starting any multi-step task, use todo_write to plan your steps",
+    搬进主干时丢了 —— 这是 todo_write 零使用的直接嫌疑之一
+    (探针实测:系统催了 5 次,模型 0 次响应)。
+
+    补回来时不能塞进 identity:none 档下工具已被弹出池子,prompt 却叫模型去用它,
+    那就是「关一半」—— 跟 is_slow_operation 把 pytest 丢后台、模型只拿到占位符
+    再试一次还是占位符(实测空转 15 步)是同一个形状。
+    """
+    monkeypatch.setattr(trunk, "TODO_MODE", "none")
+    p = trunk.assemble_system_prompt({})
+    assert "todo_write" not in p  # 工具没了,叫模型用它的话也必须没了
+
+    for mode in ("tool", "nudge"):
+        monkeypatch.setattr(trunk, "TODO_MODE", mode)
+        p = trunk.assemble_system_prompt({})
+        assert "use todo_write to plan your steps" in p, mode

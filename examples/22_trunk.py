@@ -2879,6 +2879,17 @@ TOOL_REGISTRY = {
 
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
+    # 【2026-08-14 补回】课程 s05_todo_write/code.py:52 原本在 SYSTEM 里就有这句
+    # ("s05 change: SYSTEM prompt adds planning guidance"),搬进主干时丢了。
+    # 🪝 课程把「什么时候用」放在 system prompt 里,工具描述反而只有一句话;
+    #    主干反过来 —— 描述写了 270 字的「用的时候小心」,却没人告诉模型何时该用。
+    # ⚠️ 这一段必须【按 TODO_MODE 条件加载】,不能塞进 identity:
+    #    none 档下工具不在池子里,prompt 却叫模型去用它 —— 那就是「关一半」,
+    #    跟 is_slow_operation 把 pytest 丢后台后模型只拿到占位符是同一个形状。
+    "planning": (
+        "Before starting any multi-step task, use todo_write to plan your steps. "
+        "Update status as you go."
+    ),
     "workspace": f"Working directory: {WORKDIR}",
     "memory": "Relevant memories are injected below when available.",
 }
@@ -2898,6 +2909,11 @@ def assemble_system_prompt(context: dict) -> str:
     # 前缀一变缓存全失效(get_system_prompt 的 docstring 提到的 stable section ordering)。
     sections.append(f"Available tools: {', '.join(assemble_tool_pool().keys())}.")
     sections.append(PROMPT_SECTIONS["workspace"])
+
+    # 规划引导只在 todo 这一层【真的开着】时才给 —— 系统给出的指令必须落在
+    # 系统给出的能力范围内。none 档下工具已被 assemble_tool_pool 弹出池子。
+    if TODO_MODE != "none":
+        sections.append(PROMPT_SECTIONS["planning"])
 
     # Conditional — memory loaded when MEMORY.md exists and has content
     memories = context.get("memories", "")
