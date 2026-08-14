@@ -2879,7 +2879,6 @@ TOOL_REGISTRY = {
 
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
-    "tools": f"Available tools: {', '.join(TOOL_REGISTRY.keys())}.",
     "workspace": f"Working directory: {WORKDIR}",
     "memory": "Relevant memories are injected below when available.",
 }
@@ -2891,7 +2890,13 @@ def assemble_system_prompt(context: dict) -> str:
 
     # Always loaded — identity, tools, workspace
     sections.append(PROMPT_SECTIONS["identity"])
-    sections.append(PROMPT_SECTIONS["tools"])
+    # tools 这一节【不能】住在 PROMPT_SECTIONS 里:那是模块级字典,f-string 在 import
+    # 那一刻就求值成死字符串,之后工具池怎么变都不跟着变(MCP 是运行时 connect 进来的)。
+    # 而且必须报【当轮工具池】而不是 TOOL_REGISTRY 全集 —— 否则 TODO_MODE=none 那一臂
+    # 的 prompt 里还写着 todo_write,消融臂的痕迹擦不干净。
+    # 顺序保持 identity → tools → workspace:section 顺序是 prompt 缓存的一部分,
+    # 前缀一变缓存全失效(get_system_prompt 的 docstring 提到的 stable section ordering)。
+    sections.append(f"Available tools: {', '.join(assemble_tool_pool().keys())}.")
     sections.append(PROMPT_SECTIONS["workspace"])
 
     # Conditional — memory loaded when MEMORY.md exists and has content
@@ -2906,32 +2911,40 @@ def assemble_system_prompt(context: dict) -> str:
     return "\n\n".join(sections)
 
 
-_last_context_key = None
-_last_prompt = None
-
-
 def get_system_prompt(context: dict) -> str:
-    """Cache wrapper — reassemble only when context changes.
+    """Assemble the system prompt and report which sections went in.
 
-    Uses json.dumps for deterministic serialization, not Python's hash()
-    which has process randomization and fails on nested dicts/lists.
-    This cache only avoids redundant string assembly within a process.
-    Real Claude Code additionally protects API-level prompt cache via
-    stable section ordering and SYSTEM_PROMPT_DYNAMIC_BOUNDARY.
+    【2026-08-14 删掉了这里的进程内缓存】原本拿 json.dumps(context) 当 key,
+    缓存上一次组装的结果。删掉的理由是一道算术:
+
+        被缓存的开销 = assemble_tool_pool() + 几次 append + join
+        算 key 的开销 = assemble_tool_pool() + json.dumps
+                        ^^^^^^^^^^^^^^^^^^^ 一模一样,一份都省不掉
+                        (工具池也是 prompt 的输入,正确的 key 必须覆盖它)
+
+    为了判断「能不能用缓存」,得先把被缓存的事做掉大半;省下的只是 join 与
+    json.dumps 的差额,大概率还是负的。
+    🪝 当「验证缓存是否有效」的成本 ≈「重新算一遍」的成本时,这个缓存就不该存在。
+
+    ⚠️ 它原本还是错的:key 只由 context 决定,而 prompt 的真实输入是 context
+       【和当轮工具池】两个 —— 连上 MCP 后工具池变了、context 没变,会返回过期
+       的 prompt(tests/test_prompt_assembly.py 里那条 staleness 测试钉的就是这个)。
+       🪝 缓存 key 必须覆盖它实际依赖的全部输入。
+
+    📌 别把这个进程内小缓存跟【API 级 prompt 缓存】混为一谈 —— 名字一样,完全两回事:
+       真实 Claude Code 靠 stable section ordering + SYSTEM_PROMPT_DYNAMIC_BOUNDARY
+       保证【前缀稳定】,在服务端拿命中率,那才是 prompt 缓存该发生的层次。
+       (所以 assemble_system_prompt 里的 section 顺序是契约,不能随手调。)
     """
-    global _last_context_key, _last_prompt
-    key = json.dumps(context, sort_keys=True, ensure_ascii=False, default=str)
-    if key == _last_context_key and _last_prompt:
-        print("  \033[90m[cache hit] system prompt unchanged\033[0m")
-        return _last_prompt
-    _last_context_key = key
-    _last_prompt = assemble_system_prompt(context)
+    prompt = assemble_system_prompt(context)
 
     loaded = ["identity", "tools", "workspace"]
     if context.get("memories"):
         loaded.append("memory")
+    if context.get("skills"):
+        loaded.append("skills")
     print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
-    return _last_prompt
+    return prompt
 
 
 def update_context(context: dict, messages: list) -> dict:
