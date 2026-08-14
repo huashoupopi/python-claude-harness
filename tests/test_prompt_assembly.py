@@ -78,8 +78,19 @@ def test_update_context_derives_from_real_state(sandbox):
     记忆相关的断言拆到下面两条,用 monkeypatch 挡住真实请求。
     """
     ctx = sandbox.update_context({}, [])
-    assert ctx["enabled_tools"] == list(sandbox.TOOL_REGISTRY.keys())
+    # 🔴 2026-08-14:enabled_tools 报的是【当轮工具池】,不是 TOOL_REGISTRY 全集。
+    # 字段名叫 enabled_tools 就该是「这一轮真的开着的」;报全集则 context 不完整 ——
+    # 而 context 的定义是「prompt 全部输入的快照」。
+    assert ctx["enabled_tools"] == list(sandbox.assemble_tool_pool().keys())
     assert ctx["workspace"] == str(sandbox.WORKDIR)
+
+
+def test_context_tracks_ablation_switches(sandbox, monkeypatch):
+    """context 必须跟着消融开关走 —— 否则「快照」这个说法就是假的。"""
+    monkeypatch.setattr(sandbox, "TODO_MODE", "nudge")
+    assert "todo_write" in sandbox.update_context({}, [])["enabled_tools"]
+    monkeypatch.setattr(sandbox, "TODO_MODE", "none")
+    assert "todo_write" not in sandbox.update_context({}, [])["enabled_tools"]
 
 
 def test_memory_mode_controls_injection(sandbox, monkeypatch):

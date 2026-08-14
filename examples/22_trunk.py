@@ -2964,7 +2964,13 @@ def update_context(context: dict, messages: list) -> dict:
             _memories_cache = load_memories(messages)
         memories = _memories_cache
     return {
-        "enabled_tools": list(TOOL_REGISTRY.keys()),  # list(TOOL_HANDLER.keys())
+        # 【2026-08-14】原来是 list(TOOL_REGISTRY.keys()) —— 报的是【全集】。
+        # 字段名叫 enabled_tools,报的却是「注册过的所有工具」,名不副实;
+        # 而且这让 context 不完整:context 的定义是「prompt 全部输入的快照」,
+        # 工具池明明会随 MEMORY_MODE/TODO_MODE 变,快照里却看不出来。
+        # 🪝 老缓存过期(key=json.dumps(context) 却跟不上工具池)只是这个不完整的【症状】,
+        #    根因在这一行。改对之后,将来若要重新加一个正确的缓存,key 用 context 就是对的。
+        "enabled_tools": list(assemble_tool_pool().keys()),
         "workspace": str(WORKDIR),
         "memories": memories,
         "skills": list_skills(),
