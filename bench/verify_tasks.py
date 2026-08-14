@@ -22,6 +22,18 @@ from pathlib import Path
 
 HERE = Path(__file__).parent.resolve()
 TASKS_DIR = HERE / "tasks"
+# 🔴 2026-08-15:发卷/判分一律排除字节码缓存。
+# 踩过的坑:copytree 把原卷的 __pycache__ 一起拷进考场,而 shutil.copy2 覆盖 .py 时
+# 【保留原 mtime】;Python 判断 .pyc 是否有效看的是「记录的 (mtime,size) 与 .py 是否一致」,
+# 而 solution 与 repo 的同名文件是同一个脚本同秒生成、连字节数都一样
+# (`len(v) == 10` vs `len(v) == 11`) → 检查通过 → 加载的是【带 bug 的旧字节码】,
+# 于是【标准答案被判失败】。dry-run 与 verify_tasks 全中招。
+# 🪝 冒烟闸自己也会被污染,它同样需要被验证。
+# 🪝 同族:代码依赖了「当前环境恰好有/没有某个东西」(ensure_dirs 缺 parents 靠别处建好目录、
+#    load_dotenv 靠 cwd 恰好能往上找到 .env)。
+IGNORE_CACHES = shutil.ignore_patterns("__pycache__", ".pytest_cache", "*.pyc")
+
+
 DELETIONS = "_deletions.txt"
 
 
@@ -44,7 +56,7 @@ def apply_solution(sol_dir: Path, repo: Path):
                 if line.strip() and target.exists():
                     target.unlink()
         else:
-            shutil.copy2(f, repo / f.name)
+            shutil.copy(f, repo / f.name)
 
 
 failures = []
@@ -56,7 +68,7 @@ for task_dir in sorted(TASKS_DIR.iterdir()):
 
     with tempfile.TemporaryDirectory() as td:
         repo = Path(td) / "repo"
-        shutil.copytree(task_dir / "repo", repo)
+        shutil.copytree(task_dir / "repo", repo, ignore=IGNORE_CACHES)
         red_ok, red_msg = grade(task_dir, repo)
         red_ok = not red_ok  # 原题【必须失败】
 
@@ -68,7 +80,7 @@ for task_dir in sorted(TASKS_DIR.iterdir()):
 
     with tempfile.TemporaryDirectory() as td:
         repo = Path(td) / "repo"
-        shutil.copytree(task_dir / "repo", repo)
+        shutil.copytree(task_dir / "repo", repo, ignore=IGNORE_CACHES)
         apply_solution(sol_dir, repo)
         green_ok, green_msg = grade(task_dir, repo)
 

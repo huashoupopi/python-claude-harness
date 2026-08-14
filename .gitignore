@@ -31,3 +31,9 @@ bench/runs/
 # === 学习用的一次性演示脚本(不是 harness 的一部分) ===
 copy_demo.py
 
+
+# bench 考场产物(__pycache__/.pytest_cache 上面已有)
+# ⚠️ .gitignore 挡不住那个判分 bug —— 它只管 git 追不追,不管文件在不在磁盘上;
+#    真正的修复是 copytree(ignore=IGNORE_CACHES),别把这两件事混为一谈。
+bench/runs/
+.bench_trace.json

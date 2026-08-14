@@ -13,11 +13,14 @@
                        几秒钟跑完全链路 —— 用来验发卷/判分/登分/并发本身有没有 bug
 """
 
+import difflib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -66,6 +69,18 @@ CONFIGS = {
     "todo_tool": {"MEMORY_MODE": "self", "TODO_MODE": "tool"},
 }
 
+# 🔴 2026-08-15:发卷/判分一律排除字节码缓存。
+# 踩过的坑:copytree 把原卷的 __pycache__ 一起拷进考场,而 shutil.copy2 覆盖 .py 时
+# 【保留原 mtime】;Python 判断 .pyc 是否有效看的是「记录的 (mtime,size) 与 .py 是否一致」,
+# 而 solution 与 repo 的同名文件是同一个脚本同秒生成、连字节数都一样
+# (`len(v) == 10` vs `len(v) == 11`) → 检查通过 → 加载的是【带 bug 的旧字节码】,
+# 于是【标准答案被判失败】。dry-run 与 verify_tasks 全中招。
+# 🪝 冒烟闸自己也会被污染,它同样需要被验证。
+# 🪝 同族:代码依赖了「当前环境恰好有/没有某个东西」(ensure_dirs 缺 parents 靠别处建好目录、
+#    load_dotenv 靠 cwd 恰好能往上找到 .env)。
+IGNORE_CACHES = shutil.ignore_patterns("__pycache__", ".pytest_cache", "*.pyc")
+
+
 _io_lock = threading.Lock()  # 保护 results.jsonl 与 print —— 并发下两者都会交错
 
 
@@ -91,7 +106,7 @@ def apply_solution(sol_dir: Path, repo: Path):
                 if line.strip() and target.exists():
                     target.unlink()
         else:
-            shutil.copy2(f, repo / f.name)
+            shutil.copy(f, repo / f.name)
 
 
 def restore_tests(task_dir: Path, repo: Path) -> list[str]:
@@ -127,15 +142,99 @@ def restore_tests(task_dir: Path, repo: Path) -> list[str]:
     for stale in repo.glob("test_*.py"):
         stale.unlink()
     for orig in originals:
-        shutil.copy2(orig, repo / orig.name)
+        shutil.copy(orig, repo / orig.name)
     return tampered + [f"+{name}" for name in extra]  # "+" 前缀 = agent 新建的
+
+
+PYTEST_TAIL = re.compile(r"(\d+)\s+(passed|failed|errors?|skipped)")
+
+
+def parse_pytest(text: str) -> dict:
+    """从 pytest -q 的最后一行抠出条数。
+
+    🔴 为什么要这个:原来 success 只是 `returncode == 0`,一个布尔。
+    但题目有 4-8 条测试,「过了 7/8」和「过了 2/8」被记成同一个 False ——
+    成倍的信息量白白丢掉,而这两种失败在归因上完全是两回事
+    (差一点做完 vs 根本没做对)。
+    """
+    out = {"passed": 0, "failed": 0, "error": 0, "skipped": 0}
+    lines = text.strip().splitlines()
+    if not lines:
+        return out
+    for n, word in PYTEST_TAIL.findall(lines[-1]):
+        out["error" if word.startswith("error") else word] = int(n)
+    return out
+
+
+IGNORE_PARTS = {"skills", "__pycache__"}
+
+
+def _repo_files(root: Path) -> dict:
+    """考场里属于「题目」的文件。排除 harness 自己拉的屎(.memory/.tasks/…)与技能库。"""
+    files = {}
+    for p in sorted(root.rglob("*")):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(root)
+        if any(x.startswith(".") or x in IGNORE_PARTS for x in rel.parts):
+            continue
+        try:
+            files[str(rel)] = p.read_text(encoding="utf-8").splitlines()
+        except (UnicodeDecodeError, OSError):
+            files[str(rel)] = ["<binary>"]
+    return files
+
+
+def diff_stats(task_dir: Path, repo: Path) -> dict:
+    """考场 vs 原卷改了多少 —— 两个都 PASS 的臂,改 3 行和改 80 行不是一回事。
+
+    在 restore_tests 之后算,所以这里只反映【源码】改动;
+    对测试文件动手脚单独记在 tests_tampered,两件事不要混。
+    """
+    before, after = _repo_files(task_dir / "repo"), _repo_files(repo)
+    added_lines = removed_lines = 0
+    for rel in set(before) | set(after):
+        for line in difflib.unified_diff(before.get(rel, []), after.get(rel, []), n=0):
+            if line.startswith("+") and not line.startswith("+++"):
+                added_lines += 1
+            elif line.startswith("-") and not line.startswith("---"):
+                removed_lines += 1
+    return {
+        "files_touched": sum(
+            1 for rel in set(before) | set(after) if before.get(rel) != after.get(rel)
+        ),
+        "files_created": len(set(after) - set(before)),
+        "files_deleted": len(set(before) - set(after)),
+        "lines_added": added_lines,
+        "lines_removed": removed_lines,
+    }
+
+
+def expected_total(task_dir: Path) -> int:
+    """这道题满分是几条 —— 拿标准答案实跑一次得到,不靠手写常量。
+
+    🪝 手写常量会腐烂:题目加一条测试而常量没跟着改,通过率就悄悄失真。
+    让它从「答案跑一遍」派生,加测试时自动跟上。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        repo = Path(td) / "repo"
+        shutil.copytree(task_dir / "repo", repo, ignore=IGNORE_CACHES)
+        sol = task_dir / "solution"
+        if sol.is_dir():
+            apply_solution(sol, repo)
+        p = subprocess.run(
+            ["bash", str(task_dir / "grade.sh"), str(repo)],
+            capture_output=True,
+            text=True,
+        )
+        return parse_pytest(p.stdout + p.stderr)["passed"]
 
 
 def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
     """一个考试单元:发卷 → 监考 → 收卷 → 登分。并发安全:只在末尾用锁写共享资源。"""
     repo = run_dir / name / task_dir.name / f"repo{trial}"
     logs = run_dir / name / task_dir.name / f"logs{trial}"
-    shutil.copytree(task_dir / "repo", repo)
+    shutil.copytree(task_dir / "repo", repo, ignore=IGNORE_CACHES)
     logs.mkdir(parents=True, exist_ok=True)
 
     # ① 技能库要跟着考场走 —— 主干里 SKILLS_DIR = Path.cwd() / "skills",
@@ -191,16 +290,44 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
     proc2 = subprocess.run(
         ["bash", str(task_dir / "grade.sh"), str(repo)], capture_output=True, text=True
     )
+    counts = parse_pytest(proc2.stdout + proc2.stderr)
+    total = EXPECTED[task_dir.name]
+
+    # agent_runner 在【发请求那一刻】记下的轨迹(reminder 注入次数、上下文规模…);
+    # 超时被 kill 的那次可能没写成,所以要容错 —— 不能因为拿不到轨迹就丢掉整条记录。
+    trace = {}
+    trace_path = repo / ".bench_trace.json"
+    if trace_path.exists():
+        try:
+            trace = json.loads(trace_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            trace = {"parse_error": True}
+    turns = trace.get("turns", [])
+
     record = {
         "config": name,
         "trial": trial,
         "task": task_dir.name,
         "success": proc2.returncode == 0,
+        # 🔴 不再只有布尔:「过了 7/8」和「过了 2/8」在归因上是两回事
+        "passed": counts["passed"],
+        "total": total,
+        "pass_rate": round(counts["passed"] / total, 3) if total else 0.0,
+        "collect_error": counts["error"] > 0,  # 收集就挂了 ≠ 断言失败
         "steps": steps,
         "duration_s": duration,
         "timed_out": timed_out,
         "tests_tampered": tampered,  # 非空 = 考生动过卷子(已按原卷判,但行为要留痕)
         "workers": WORKERS,  # duration 的解释需要它:并发下这个数不可跨批比较
+        # ── 改动范围:两个都 PASS 的臂,改 3 行和改 80 行不是一回事 ──
+        **diff_stats(task_dir, repo),
+        # ── 看不见的注入:stdout 里没有 reminder / system prompt / 记忆 ──
+        "turns": len(turns),
+        "sys_prompt_chars": trace.get("system_prompt_chars", 0),
+        "reminders": turns[-1]["reminders"] if turns else 0,
+        "todo_calls": turns[-1]["todo_calls"] if turns else 0,
+        "memory_injected": any(t.get("memory_injected") for t in turns),
+        "ctx_chars_max": max((t["chars"] for t in turns), default=0),
     }
 
     with _io_lock:
@@ -211,7 +338,7 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
             f"{'PASSED' if record['success'] else 'FAILED'}"
             f"{' (TIMEOUT)' if timed_out else ''}"
             f"{' ⚠️ TAMPERED: ' + ','.join(tampered) if tampered else ''}"
-            f"  steps={steps} {duration:.0f}s",
+            f"  {counts['passed']}/{total}  steps={steps} {duration:.0f}s",
             flush=True,
         )
     return record
@@ -226,6 +353,10 @@ units = [
 ]
 
 run_dir.mkdir(parents=True, exist_ok=True)
+# 每题满分几条 —— 由标准答案实跑派生,不写常量(题目加测试时自动跟上)
+EXPECTED = {
+    td.name: expected_total(td) for td in sorted(TASKS_DIR.iterdir()) if td.is_dir()
+}
 print(
     f"{'[DRY RUN] ' if DRY_RUN else ''}"
     f"{len(units)} 个单元 = {len(CONFIGS)} 臂 × {TRIALS} trial × "
@@ -243,9 +374,20 @@ with ThreadPoolExecutor(max_workers=WORKERS) as ex:
 print(f"\n=== 成绩单 ({time.time() - t0:.0f}s) ===")
 for name in CONFIGS:
     rows = [r for r in results if r["config"] == name]
-    passed = sum(1 for r in rows if r["success"])
-    avg_steps = sum(r["steps"] for r in rows) / len(rows) if rows else 0
-    print(f"  {name:14s} {passed}/{len(rows)} passed   avg steps {avg_steps:.1f}")
+    if not rows:
+        continue
+    n = len(rows)
+    full = sum(1 for r in rows if r["success"])
+    avg = lambda k: sum(r[k] for r in rows) / n  # noqa: E731
+    print(
+        f"  {name:14s} 全过 {full}/{n}   "
+        f"平均通过率 {avg('pass_rate'):.2f}   "
+        f"steps {avg('steps'):.1f}   "
+        f"改动 {avg('lines_added') + avg('lines_removed'):.0f} 行/"
+        f"{avg('files_touched'):.1f} 文件   "
+        f"催 {avg('reminders'):.1f} 次 → todo {avg('todo_calls'):.1f} 次   "
+        f"上下文峰值 {avg('ctx_chars_max') / 1000:.1f}k 字符"
+    )
 
 bad = [r for r in results if r["tests_tampered"]]
 slow = [r for r in results if r["timed_out"]]
