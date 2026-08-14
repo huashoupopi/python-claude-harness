@@ -58,11 +58,52 @@ def test_cache_key_ignores_dict_ordering(trunk):
 
 
 def test_update_context_derives_from_real_state(sandbox):
-    """context 不是手填的,是从真实状态派生:工具表 + 工作目录 + 记忆文件。"""
+    """context 不是手填的,是从真实状态派生:工具表 + 工作目录。
+
+    ⚠️ 2026-08-13 行为变更:memories 那一格不再直接读 MEMORY.md,
+    改成按 MEMORY_MODE 走 load_memories(会调 LLM 挑相关记忆)。
+    记忆相关的断言拆到下面两条,用 monkeypatch 挡住真实请求。
+    """
     ctx = sandbox.update_context({}, [])
     assert ctx["enabled_tools"] == list(sandbox.TOOL_REGISTRY.keys())
-    assert ctx["memories"] == ""  # sandbox 里 MEMORY.md 还不存在
+    assert ctx["workspace"] == str(sandbox.WORKDIR)
 
-    sandbox.MEMORY_INDEX.write_text("记住:用中文")
-    ctx2 = sandbox.update_context({}, [])
-    assert ctx2["memories"] == "记住:用中文"
+
+def test_memory_mode_controls_injection(sandbox, monkeypatch):
+    """三模式各自的注入行为:只有 self 往 context 里放记忆。
+
+    none      模型完全不知道有记忆
+    self      系统挑好塞给它
+    official  模型自己调 memory 工具去看,系统不代劳
+    """
+    monkeypatch.setattr(sandbox, "load_memories", lambda msgs: "FAKE_MEMORY")
+    msgs = [{"role": "user", "content": "x"}]
+    for mode, expected in (("none", ""), ("official", ""), ("self", "FAKE_MEMORY")):
+        monkeypatch.setattr(sandbox, "MEMORY_MODE", mode)
+        monkeypatch.setattr(sandbox, "_memories_cache", None)  # 每种模式重新挑
+        ctx = sandbox.update_context({}, msgs)
+        assert ctx["memories"] == expected, f"MEMORY_MODE={mode}"
+
+
+def test_memories_selected_once_per_turn(sandbox, monkeypatch):
+    """🔴 缓存守卫:一次用户输入只挑一次记忆,不是每轮都挑。
+
+    update_context 有三个调用点,其中一个在 agent_loop 循环内。
+    没有 _memories_cache 的话,一轮对话最多触发 26 次额外 LLM 请求 ——
+    既烧钱,也让 stage-1 的 self_memory 那组数据不可比。
+    这条测试守的就是那个缓存。
+    """
+    calls = []
+
+    def fake_load(msgs):
+        calls.append(msgs)
+        return "M"
+
+    monkeypatch.setattr(sandbox, "load_memories", fake_load)
+    monkeypatch.setattr(sandbox, "MEMORY_MODE", "self")
+    monkeypatch.setattr(sandbox, "_memories_cache", None)
+
+    for _ in range(5):
+        sandbox.update_context({}, [{"role": "user", "content": "x"}])
+
+    assert len(calls) == 1, f"挑了 {len(calls)} 次,应该只挑 1 次"

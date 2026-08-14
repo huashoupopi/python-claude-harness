@@ -18,6 +18,7 @@ import json
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -28,6 +29,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Literal, NamedTuple
 
+import yaml
 from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel, Field
@@ -48,16 +50,620 @@ TASKS_DIR = WORKDIR / ".tasks"
 DURABLE_PATH = WORKDIR / ".scheduled_tasks.json"
 MAILBOX_DIR = WORKDIR / ".mailboxes"
 WORKTREES_DIR = WORKDIR / ".worktrees"
+TRANSCRIPT_DIR = WORKDIR / ".transcripts"
+TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
+SKILLS_DIR = WORKDIR / "skills"
 model = os.getenv("NVIDIA_MODEL")
 
 CURRENT_TODOS: list = []
 MAX_GLOB_RESULTS = 200
+CONTEXT_LIMIT = 500000
+KEEP_RECENT = 3
+PERSIST_THRESHOLD = 30000
+MEMORY_TYPES = ["user", "feedback", "project", "reference"]
+
+
+SKILL_REGISTRY: dict[str, dict] = {}
+
+
+def _scan_skills():
+    if not SKILLS_DIR.exists():
+        return
+    for d in sorted(SKILLS_DIR.iterdir()):
+        if not d.is_dir():
+            continue
+        skill_file = d / "SKILL.md"
+        if skill_file.exists():
+            raw = skill_file.read_text()
+            meta, body = _parse_frontmatter(raw)
+            name = meta.get("name", d.name)
+            description = meta.get(
+                "description", raw.split("\n")[0].lstrip("#").strip()
+            )
+            SKILL_REGISTRY[name] = {
+                "name": name,
+                "description": description,
+                "content": raw,
+            }
+
+
+def list_skills() -> str:
+    if not SKILL_REGISTRY:
+        return "(no skills found)"
+    return "\n".join(
+        f"- **{s['name']}**: {s['description']}" for s in SKILL_REGISTRY.values()
+    )
+
+
+# ---------------------------------------------------------------------------
+# 记忆层开关(T22 消融轴:stage-1 测的三个臂就是这三种模式)
+#   none      不注入、不提取、不注册 memory 工具        —— baseline
+#   self      系统自动提取 + 相关性注入,模型无感        —— self_memory
+#   official  注册 memory 工具,模型自己 view/create     —— official_memory
+#
+# 优先级:CLI 参数 --memory > 环境变量 MEMORY_MODE > 默认值
+#   环境变量这条是给 bench 用的:run_bench.py 起子进程跑,env 传得下去,
+#   而 CLI 参数走不到(agent_runner.py 不经过 main())。
+# 【2026-08-13 AI 代写:开关机制,待盲讲验收】
+# ---------------------------------------------------------------------------
+# self 模式下,select_relevant_memories 会【额外调一次 LLM】来挑相关记忆。
+# 而 update_context 有三个调用点,其中一个在 agent_loop 的循环内 ——
+# 不缓存的话一轮对话最多触发 26 次额外请求(10_memory_loop.py 是进 loop 算一次)。
+# 这里按「一次用户输入 = 选一次记忆」缓存,语义与 10 对齐,
+# stage-1 的 self_memory 那组数据才可比。None = 本轮尚未选过。
+_memories_cache: str | None = None
+
+MEMORY_MODES = ("none", "self", "official")
+MEMORY_MODE = os.getenv("MEMORY_MODE", "self")
+if MEMORY_MODE not in MEMORY_MODES:
+    # fail loud:配置错了当场炸,不要静默退回默认值 ——
+    # 否则 bench 跑完一整轮才发现「消融臂根本没生效」,数据全废。
+    raise ValueError(f"MEMORY_MODE={MEMORY_MODE!r} 不合法,只能是 {MEMORY_MODES} 之一")
+
+# 【2026-08-14 删除 ESCALATED_MAX_TOKENS = 64000】
+# 13_error_recovery.py 的截断处置是两级:①升档重来(8000→64000,丢掉半截重新生成)
+# ②保留 + 续写。本主干是【流式】的,半截输出已经一个字一个字打到用户屏幕上了,
+# 「重来」= 用户看到同一段话来两遍 —— 直接否定了流式的价值。
+# 故只保留②,升档这一级整个去掉,该常量与 RecoveryState.has_escalated 一并删除。
+# ⚠️ 附带后果(值得记):13 的①【顺带】挡住了「残缺工具调用进历史」——
+#    它丢的是整个 msg。去掉①之后这层保护也没了,所以②里必须显式
+#    build_message(text, {}) 把可能残缺的 tool_calls 丢掉,否则孤儿 → API 400。
+DEFAULT_MAX_TOKENS = 8000
+MAX_RECOVERY_RETRIES = 3
+MAX_RETRIES = 10
+BASE_DELAY_MS = 500
+MAX_CONSECUTIVE_529 = 3
+# ⚠️ 当前 FALLBACK_MODEL 与主 model 读的是【同一个环境变量】,即「切换到自己」。
+# 这是【有意保留的现状】(2026-08-13 当事人决定):手头没有第二个可用模型,
+# 目的只是先把 529 → 切换 这条路径跑通。真要有容灾,改读独立的 FALLBACK_MODEL 变量即可
+# (with_retry 里已有「没配就只打日志继续重试」的分支,值为 None 是安全的)。
+# → 切换是否真的生效,靠单元测试 monkeypatch 一个假模型名来验,不靠线上行为。
+FALLBACK_MODEL = os.getenv("NVIDIA_MODEL")
+CONTINUATION_PROMPT = "Output token limit hit. Resume directly — no apology, no recap. Pick up mid-thought."
+
+# 子代理(s06/s07):一次性、只回结论。"Do not delegate further" 是防套娃的第一道,
+# 第二道是 spawn_subagent 里从工具池摘掉 spawn_subagent / spawn_teammate。
+SUB_SYSTEM = (
+    f"You are a coding agent at {WORKDIR}. "
+    "Complete the task you were given, then return a concise summary. "
+    "Do not delegate further."
+)
+MAX_SUBAGENT_TURNS = 30
+
+
+class RecoveryState:
+    """Track recovery attempts across the loop."""
+
+    def __init__(self):
+        # 【2026-08-14 删掉两个字段】
+        #   has_escalated —— 流式下不做「升档重来」,见 ESCALATED_MAX_TOKENS 处的说明
+        #   has_attempted_reactive_compact —— 主干用的是 agent_loop 里的局部变量
+        #       reactive_retries,这个字段定义了从来没人读没人写
+        self.recovery_count = 0  # 本轮对话已续写几次(max_tokens 截断)
+        self.consecutive_529 = 0  # 连续 529 次数,成功一次即清零
+        self.current_model = model  # 529 连败达阈值时会被换成 FALLBACK_MODEL
+
+
+def retry_delay(attempt, retry_after=None):
+    """Exponential backoff with jitter. Retry-After takes priority."""
+    if retry_after:
+        return retry_after
+    base = min(BASE_DELAY_MS * (2**attempt), 32000) / 1000
+    jitter = random.uniform(0, base * 0.25)
+    return base + jitter
+
+
+def with_retry(fn, state: RecoveryState):
+    """Exponential backoff for transient errors (429/529).
+    Non-transient errors are re-raised for the outer handler."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            result = fn()
+            state.consecutive_529 = 0
+            return result
+        except Exception as e:
+            name = type(e).__name__
+            msg = str(e).lower()
+
+            # 429 rate limit -> exponential backoff
+            if "ratelimit" in name.lower() or "429" in msg:
+                delay = retry_delay(attempt)
+                print(
+                    f"  \033[33m[429 rate limit] retry {attempt + 1}/{MAX_RETRIES},"
+                    f" wait {delay:.1f}s\033[0m"
+                )
+                time.sleep(delay)
+                continue
+
+            # 529 overloaded -> exponential backoff + fallback model
+            if "overloaded" in name.lower() or "529" in msg or "overloaded" in msg:
+                state.consecutive_529 += 1
+                if state.consecutive_529 >= MAX_CONSECUTIVE_529:
+                    if FALLBACK_MODEL:
+                        state.current_model = FALLBACK_MODEL
+                        state.consecutive_529 = 0
+                        print(
+                            f"  \033[31m[529 x{MAX_CONSECUTIVE_529}]"
+                            f" switching to {FALLBACK_MODEL}\033[0m"
+                        )
+                    else:
+                        state.consecutive_529 = 0
+                        print(
+                            f"  \033[31m[529 x{MAX_CONSECUTIVE_529}]"
+                            f" no FALLBACK_MODEL_ID configured, continuing retry\033[0m"
+                        )
+                delay = retry_delay(attempt)
+                print(
+                    f"  \033[33m[529 overloaded] retry {attempt + 1}/{MAX_RETRIES},"
+                    f" wait {delay:.1f}s\033[0m"
+                )
+                time.sleep(delay)
+                continue
+
+            # Not transient -> re-raise for outer try/except
+            raise
+    raise RuntimeError(f"Max retries ({MAX_RETRIES}) exceeded")
+
+
+def is_prompt_too_long_error(e: Exception) -> bool:
+    """Check whether an API error indicates prompt/context too long."""
+    msg = str(e).lower()
+    return (
+        ("prompt" in msg and "long" in msg)
+        or "prompt_is_too_long" in msg
+        or "context_length_exceeded" in msg
+        or "max_context_window" in msg
+    )
+
+
+def _parse_frontmatter(text: str) -> tuple[dict, str]:
+    if not text.startswith("---"):
+        return {}, text
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}, text
+    try:
+        meta = yaml.safe_load(parts[1]) or {}
+    except yaml.YAMLError:
+        return {}, text
+    return meta, parts[2].strip()
+
+
+def _rebuild_index():
+    """Rebuild MEMORY.md index from all memory files."""
+    lines = []
+    for f in sorted(MEMORY_DIR.glob("*.md")):
+        if f.name == "MEMORY.md":
+            continue
+        raw = f.read_text()
+        meta, body = _parse_frontmatter(raw)
+        name = meta.get("name", f.stem)
+        desc = meta.get("description", body.split("\n")[0][:80])
+        lines.append(f"- [{name}]({f.name}) — {desc}")
+    MEMORY_INDEX.write_text("\n".join(lines) + "\n" if lines else "")
+
+
+def write_memory_file(name: str, mem_type: str, description: str, body: str):
+    """Write a single memory file with YAML frontmatter."""
+    slug = name.lower().replace(" ", "-").replace("/", "-")
+    filename = f"{slug}.md"
+    filepath = MEMORY_DIR / filename
+    filepath.write_text(
+        f"---\nname: {name}\ndescription: {description}\ntype: {mem_type}\n---\n\n{body}\n"
+    )
+    _rebuild_index()
+    return filepath
+
+
+def read_memory_index() -> str:
+    """Read MEMORY.md index (injected into SYSTEM every turn)."""
+    if not MEMORY_INDEX.exists():
+        return ""
+    text = MEMORY_INDEX.read_text().strip()
+    return text if text else ""
+
+
+def read_memory_file(filename: str) -> str | None:
+    """Read a single memory file's full content."""
+    path = MEMORY_DIR / filename
+    if not path.exists():
+        return None
+    return path.read_text()
+
+
+def list_memory_files() -> list[dict]:
+    """List all memory files with metadata."""
+    result = []
+    for f in sorted(MEMORY_DIR.glob("*.md")):
+        if f.name == "MEMORY.md":
+            continue
+        raw = f.read_text()
+        meta, body = _parse_frontmatter(raw)
+        result.append(
+            {
+                "filename": f.name,
+                "name": meta.get("name", f.stem),
+                "description": meta.get("description", ""),
+                "type": meta.get("type", "user"),
+                "body": body,
+            }
+        )
+    return result
+
+
+def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
+    files = list_memory_files()
+    if not files:
+        return []
+
+    recent_texts = []
+    for msg in reversed(messages):
+        if msg["role"] == "user":
+            recent_texts.append(msg["content"])
+        if len(recent_texts) >= 3:
+            break
+    recent = " ".join(reversed(recent_texts))[:2000]
+
+    if not recent.strip():
+        return []
+    catalog_lines = []
+    for i, f in enumerate(files):
+        catalog_lines.append(f"{i}: {f['name']} - {f['description']}")
+    catalog = "\n".join(catalog_lines)
+    prompt = (
+        "Given the recent conversation and the memory catalog below, "
+        "select the indices of memories that are clearly relevant. "
+        "Return ONLY a JSON array of integers, e.g. [0, 3]. "
+        "If none are relevant, return [].\n\n"
+        f"Recent conversation:\n{recent}\n\n"
+        f"Memory catalog:\n{catalog}"
+    )
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=200,
+        )
+        content = response.choices[0].message.content
+        content = str(content)
+        match = re.search(r"\[.*?\]", content, re.DOTALL)
+        if match:
+            indices = json.loads(match.group())
+            selected = []
+            for idx in indices:
+                if isinstance(idx, int) and 0 <= idx < len(files):
+                    selected.append(files[idx]["filename"])
+                    if len(selected) >= max_items:
+                        break
+            return selected
+    except Exception:
+        pass
+
+    # Fallback: keyword matching on name + description
+    keywords = [w.lower() for w in recent.split() if len(w) > 3]
+    selected = []
+    for f in files:
+        text = (f["name"] + " " + f["description"]).lower()
+        if any(kw in text for kw in keywords):
+            selected.append(f["filename"])
+            if len(selected) >= max_items:
+                break
+    return selected
+
+
+def load_memories(messages: list) -> str:
+    """Load relevant memory content for injection into context."""
+    selected_files = select_relevant_memories(messages)
+    if not selected_files:
+        return ""
+
+    parts = ["<relevant_memories>"]
+    for filename in selected_files:
+        content = read_memory_file(filename)
+        if content:
+            parts.append(content)
+    parts.append("</relevant_memories>")
+    return "\n\n".join(parts)
+
+
+def extract_memories(messages: list):
+    dialogue_parts = []
+    for msg in messages[-10:]:
+        dialogue_parts.append(f"{msg['role']}: {msg.get('content', '')}")
+    dialogue = "\n".join(dialogue_parts)
+
+    if not dialogue.strip():
+        return []
+    # Check existing memories to avoid duplicates
+    existing = list_memory_files()
+    existing_desc = (
+        "\n".join(f"- {m['name']}: {m['description']}" for m in existing)
+        if existing
+        else "(none)"
+    )
+
+    prompt = (
+        "Extract user preferences, constraints, or project facts from this dialogue.\n"
+        "Return a JSON array. Each item: {name, type, description, body}.\n"
+        "- name: short kebab-case identifier (e.g. 'user-preference-tabs')\n"
+        "- type: one of 'user' (user preference), 'feedback' (guidance), "
+        "'project' (project fact), 'reference' (external pointer)\n"
+        "- description: one-line summary for index lookup\n"
+        "- body: full detail in markdown\n"
+        "If nothing new or already covered by existing memories, return [].\n\n"
+        f"Existing memories:\n{existing_desc}\n\n"
+        f"Dialogue:\n{dialogue[:4000]}"
+    )
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=800,
+        )
+        content = response.choices[0].message.content
+        content = str(content)
+        match = re.search(r"\[.*\]", content, re.DOTALL)
+        if not match:
+            return
+        items = json.loads(match.group())
+        if not items:
+            return
+        count = 0
+        for mem in items:
+            name = mem.get("name", f"memory_{int(time.time())}")
+            mem_type = mem.get("type", "user")
+            desc = mem.get("description", "")
+            body = mem.get("body", "")
+            if desc and body:
+                write_memory_file(name, mem_type, desc, body)
+                count += 1
+        if count:
+            print(f"\n\033[33m[Memory: extracted {count} new memories]\033[0m")
+    except Exception:
+        pass
+
+
+CONSOLIDATE_THRESHOLD = 10
+
+
+def consolidate_memories():
+    files = list_memory_files()
+    if len(files) < CONSOLIDATE_THRESHOLD:
+        return
+    files = sorted(files, key=lambda f: (MEMORY_DIR / f["filename"]).stat().st_mtime)
+    selected = []
+    now_length = 0
+    budget = 16000
+    for f in files:
+        length = len(
+            f"## {f['filename']}\nname: {f['name']}\ndescription: {f['description']}\n{f['body']}"
+        )
+        if now_length + length > budget:
+            break
+        selected.append(f)
+        now_length += length
+
+    catalog = "\n\n".join(
+        f"## {f['filename']}\nname: {f['name']}\ndescription: {f['description']}\n{f['body']}"
+        for f in selected
+    )
+    prompt = (
+        "Consolidate the following memory files. Rules:\n"
+        "1. Merge duplicates into one\n"
+        "2. Remove outdated/contradicted memories\n"
+        "3. Keep the total under 30 memories\n"
+        "4. Preserve important user preferences above all\n"
+        "Return a JSON array. Each item: {name, type, description, body}.\n\n"
+        f"{catalog}"
+    )
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=3000,
+        )
+        content = response.choices[0].message.content
+        content = str(content)
+        match = re.search(r"\[.*\]", content, re.DOTALL)
+        if not match:
+            return
+        items = json.loads(match.group())
+
+        new_names = []
+        for mem in items:
+            name = mem.get("name", f"memory_{int(time.time())}")
+            mem_type = mem.get("type", "user")
+            desc = mem.get("description", "")
+            body = mem.get("body", "")
+            if desc and body:
+                filepath = write_memory_file(name, mem_type, desc, body)
+                new_names.append(filepath.name)
+        # Remove old memory files (keep MEMORY.md)
+        for f in selected:
+            # if f.name != "MEMORY.md":
+            if f["filename"] not in new_names:
+                (MEMORY_DIR / f["filename"]).unlink()
+        _rebuild_index()
+
+        print(
+            f"\n\033[33m[Memory: consolidated {len(selected)} → {len(items)} memories]\033[0m"
+        )
+    except Exception as e:
+        print(f"[Memory: consolidation failed: {e}]")
+
+
+def _message_has_tool_use(msg):
+    if not msg.get("tool_calls"):
+        return False
+    return True
+
+
+def _is_tool_result_message(msg):
+    if msg.get("role") != "tool":
+        return False
+    if not msg.get("tool_call_id"):
+        return False
+    return True
 
 
 def ensure_dirs():
     """建运行期目录。只在启动时调用——import 本模块不该在 cwd 里造目录。"""
-    for d in (MEMORY_DIR, TASKS_DIR, MAILBOX_DIR, WORKTREES_DIR):
+    for d in (
+        MEMORY_DIR,
+        TASKS_DIR,
+        MAILBOX_DIR,
+        WORKTREES_DIR,
+        TRANSCRIPT_DIR,
+        TOOL_RESULTS_DIR,
+        SKILLS_DIR,
+    ):
         d.mkdir(exist_ok=True)
+
+
+def snip_compact(msgs, max_msgs=50):
+    if len(msgs) <= max_msgs:
+        return msgs
+    keep_head, keep_tail = 3, max_msgs - 3
+    head_end, tail_start = keep_head, len(msgs) - keep_tail
+    if head_end > 0 and _message_has_tool_use(msgs[head_end - 1]):
+        while head_end < len(msgs) and _is_tool_result_message(msgs[head_end]):
+            head_end += 1
+    if tail_start > 0 and _is_tool_result_message(msgs[tail_start]):
+        while tail_start > 0 and not _message_has_tool_use(msgs[tail_start]):
+            tail_start -= 1
+    if head_end >= tail_start:
+        return msgs
+    snipped = tail_start - head_end
+    return (
+        msgs[:head_end]
+        + [{"role": "user", "content": f"[snipped {snipped} messages]"}]
+        + msgs[tail_start:]
+    )
+
+
+def collect_tool_results(msgs):
+    results = []
+    for i, msg in enumerate(msgs):
+        if _is_tool_result_message(msg):
+            results.append(
+                {
+                    "index": i,
+                    "tool_call_id": msg.get("tool_call_id"),
+                    "msg": msg,
+                }
+            )
+    return results
+
+
+def micro_compact(msgs):
+    tool_results = collect_tool_results(msgs)
+    if len(tool_results) <= KEEP_RECENT:
+        return msgs
+    # for _, _, msg in tool_results[:-KEEP_RECENT]:
+    for dic in tool_results[:-KEEP_RECENT]:
+        if len(dic["msg"].get("content", "")) > 120:
+            dic["msg"]["content"] = "[tool result snipped]"
+    return msgs
+
+
+def persist_large_output(tc_id, output):
+    if len(output) <= PERSIST_THRESHOLD:
+        return output
+    TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = TOOL_RESULTS_DIR / f"{tc_id}.txt"
+    if not path.exists():
+        path.write_text(output)
+    return f"<persisted-output>\nFull output: {path}\nPreview:\n{output[:2000]}\n</persisted-output>"
+
+
+def tool_result_budget(msgs, max_bytes=200_000):
+    last = msgs[-1] if msgs else None
+    if not last or not _is_tool_result_message(last):
+        return msgs
+    batch = []
+    for i in range(len(msgs) - 1, -1, -1):
+        msg = msgs[i]
+        if not _is_tool_result_message(msg):
+            continue
+        batch.append(msg)
+    total_bytes = sum(len(m.get("content", "")) for m in batch)
+    if total_bytes <= max_bytes:
+        return msgs
+    ranked = sorted(batch, key=lambda m: len(m.get("content", "")), reverse=True)
+    for m in ranked:
+        if total_bytes <= max_bytes:
+            break
+        content = m.get("content", "")
+        if len(content) <= PERSIST_THRESHOLD:
+            continue
+        tc_id = m.get("tool_call_id")
+        m["content"] = persist_large_output(tc_id, content)
+        total_bytes = sum(len(m.get("content", "")) for m in batch)
+    return msgs
+
+
+def write_transcript(msgs):
+    TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+    path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
+    with path.open("w") as f:
+        for msg in msgs:
+            f.write(json.dumps(msg, default=str) + "\n")
+    return path
+
+
+def summarize_history(msgs):
+    conversation = json.dumps(msgs, default=str)[:80000]
+    prompt = (
+        "Summarize this coding-agent conversation so work can continue.\n"
+        "Preserve: 1. current goal, 2. key findings/decisions, 3. files read/changed, "
+        "4. remaining work, 5. user constraints.\nBe compact but concrete.\n\n"
+        + conversation
+    )
+    response = client.chat.completions.create(
+        model=model, messages=[{"role": "user", "content": prompt}], max_tokens=2000
+    )
+    return response.choices[0].message.content.strip() or "(empty summary)"
+
+
+def compact_history(msgs):
+    transcript_path = write_transcript(msgs)
+    print(f"[transcript saved: {transcript_path}]")
+    summary = summarize_history(msgs)
+    return [{"role": "user", "content": f"[Compacted]\n\n{summary}"}]
+
+
+# Emergency: reactiveCompact — on API error
+def reactive_compact(msgs):
+    transcript = write_transcript(msgs)
+    summary = summarize_history(msgs)
+    tail_start = max(1, len(msgs) - 5)
+    if tail_start > 1 and _is_tool_result_message(msgs[tail_start]):
+        while tail_start > 1 and not _message_has_tool_use(msgs[tail_start]):
+            tail_start -= 1
+    return [
+        {"role": "user", "content": f"[Reactive compact]\n\n{summary}"},
+        *msgs[tail_start:],
+    ]
 
 
 HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []}
@@ -81,12 +687,11 @@ def log_hook(name, args):
     print(f"\033[90m[HOOK] {name}({args_preview})\033[0m")
 
 
-def large_output_hook(name, output):
-    """PostToolUse: warn on large output."""
-    if len(str(output)) > 100000:
-        print(
-            f"\033[33m[HOOK] ⚠ Large output from {name}: {len(str(output))} chars\033[0m"
-        )
+# 【2026-08-13 删除 large_output_hook】它警告「输出 > 100000 字符」,但那道线
+# 永远碰不到:persist_large_output 在 30000 就把大输出落盘换成占位符了,
+# 而 run_bash 自己还有 [:50000] 截断 —— 上游三道闸全在它前面。
+# 留一个永不触发的 hook 就是又一个僵尸。大输出的处置归 compact L3 管。
+# ⚠️ PostToolUse 这个【时机】保留(agent_loop 里仍在 trigger),只是当前无订阅者。
 
 
 # UserPromptSubmit hook: log user input before it reaches the LLM
@@ -123,7 +728,9 @@ def require_approval(name: str, args: dict, reason: str) -> str | None:
       try/except 挡住「压根读不到」—— /dev/null 抛 EOFError、Ctrl-C 抛 KeyboardInterrupt
     """
     if not sys.stdin.isatty():
-        return f"Permission denied: non-interactive environment, cannot confirm {reason}"
+        return (
+            f"Permission denied: non-interactive environment, cannot confirm {reason}"
+        )
 
     # 确定要问人了,才打印给人看的东西
     print(f"\n\033[33m⚠  {reason}\033[0m")
@@ -144,9 +751,7 @@ def permission_hook(name, args):
                 return "Permission denied by deny list"
         for kw in DESTRUCTIVE:
             if kw in args.get("command", ""):
-                denied = require_approval(
-                    name, args, "potentially destructive command"
-                )
+                denied = require_approval(name, args, "potentially destructive command")
                 if denied:
                     return denied
     if name in ("write_file", "edit_file"):
@@ -161,7 +766,6 @@ def permission_hook(name, args):
 register_hook("UserPromptSubmit", context_inject_hook)
 register_hook("PreToolUse", log_hook)
 register_hook("PreToolUse", permission_hook)
-register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", summary_hook)
 
 
@@ -1246,6 +1850,12 @@ class TodoWriteArgs(BaseModel):
     )
 
 
+class CompactArgs(BaseModel):
+    focus: str = Field(
+        ..., description="Summarize earlier conversation to free context space."
+    )
+
+
 class CreateTaskArgs(BaseModel):
     subject: str = Field(..., description="the subject of the task")
     description: str = Field("", description="the description of the task")
@@ -1296,6 +1906,40 @@ class SpawnTeammateArgs(BaseModel):
     name: str = Field(..., description="the name of the teammate agent")
     role: str = Field(..., description="the role or persona of the teammate agent")
     prompt: str = Field(..., description="the initial prompt for the teammate agent")
+
+
+class MemoryArgs(BaseModel):
+    command: Literal["view", "create", "str_replace", "insert", "delete", "rename"] = (
+        Field(..., description="The memory operation to perform")
+    )
+    path: str | None = Field(
+        None,
+        description="Virtual path starting with /memories (for view/create/str_replace/insert/delete) ... e.g. /memories/preferences.md",
+    )
+    view_range: list[int] | None = Field(
+        None,
+        description="view only: [start_line, end_line]; end -1 means to end of file",
+    )
+    file_text: str | None = Field(
+        None, description="create only: full file content to write"
+    )
+    old_str: str | None = Field(
+        None,
+        description="str_replace only: exact text to find, must appear exactly once",
+    )
+    new_str: str | None = Field(
+        None, description="str_replace only: replacement; omit to delete old_str"
+    )
+    insert_line: int | None = Field(
+        None, description="insert only: insert after this line number; 0 = top of file"
+    )
+    insert_text: str | None = Field(None, description="insert only: the text to insert")
+    old_path: str | None = Field(None, description="rename only: source path")
+    new_path: str | None = Field(None, description="rename only: destination path")
+
+
+class SkillsArgs(BaseModel):
+    name: str = Field(..., description="name of the skill to load")
 
 
 class CreateWorktreeArgs(BaseModel):
@@ -1420,6 +2064,284 @@ def run_todo_write(todos: list) -> str:
         lines.append(f"  [{icon}] {t['content']}")
     print("\n".join(lines))
     return f"Updated {len(CURRENT_TODOS)} tasks"
+
+
+def resolve_memory_path(path: str) -> Path:
+    first_path = Path("/memories")
+    p = Path(path)
+    if not p.is_relative_to(first_path):
+        raise ValueError(
+            f"Error: Invalid path '{path}'. All paths must start with /memories — for example /memories/notes.md"
+        )
+    relative_path = p.relative_to(first_path)
+    real_path = (MEMORY_DIR / relative_path).resolve()
+    if not real_path.is_relative_to(MEMORY_DIR.resolve()):
+        raise ValueError(
+            f"Error: Invalid path '{path}'. All paths must start with /memories — for example /memories/notes.md"
+        )
+    return real_path
+
+
+def run_memory_view(path: str, view_range: list[int] | None = None) -> str:
+    real = resolve_memory_path(path)
+    if not real.exists():
+        return f"The path {path} does not exist. Please provide a valid path."
+    if real.is_dir():
+        return _format_dir(real, path)
+    else:
+        return _format_file(real, path, view_range)
+
+
+def _human_size(size):
+    return f"{max(size, 1) / 1024:.1f}K"
+
+
+def _format_file(real: Path, virtual: str, view_range: list[int] | None = None) -> str:
+    lines = real.read_text().splitlines()
+    start, end = 1, len(lines)
+    if view_range is not None:
+        start = view_range[0] if view_range[0] else 1
+        end = view_range[1] if view_range[1] != -1 else len(lines)
+    out = [f"Here's the content of {virtual} with line numbers:"]
+    for i in range(start, end + 1):
+        out.append(f"{i:>6}\t{lines[i - 1]}")
+
+    return "\n".join(out)
+
+
+def _format_dir(real: Path, virtual: str) -> str:
+    out = [
+        f"Here're the files and directories up to 2 levels deep in {virtual}, excluding hidden items and node_modules:"
+    ]
+    out.append(f"{_human_size(real.stat().st_size)}\t{virtual}")
+    for entry in sorted(real.glob("*")) + sorted(real.glob("*/*")):
+        if any(
+            en.startswith(".") or en == "node_modules" or en == "MEMORY.md"
+            for en in entry.relative_to(real).parts
+        ):
+            continue
+        temp = virtual / entry.relative_to(real)
+        out.append(f"{_human_size(entry.stat().st_size)}\t{temp}")
+    return "\n".join(out)
+
+
+def run_memory_create(path: str, file_text: str) -> str:
+    real = resolve_memory_path(path)
+    if real.name == "MEMORY.md":
+        return f"Error: The path {path} is reserved"
+    real.parent.mkdir(parents=True, exist_ok=True)
+    real.write_text(file_text)
+    _rebuild_index()
+    return f"File created successfully at: {path}"
+
+
+def run_memory_str_replace(path: str, old_str: str, new_str: str | None = None) -> str:
+    real = resolve_memory_path(path)
+    if not real.is_file():
+        return f"Error: The path {path} does not exist. Please provide a valid path."
+    if real.name == "MEMORY.md":
+        return f"Error: The path {path} is reserved"
+    text = real.read_text()
+    if old_str not in text:
+        return f"No replacement was performed, old_str `{old_str}` did not appear verbatim in {path}."
+    counts = text.count(old_str)
+    if counts == 1:
+        if new_str is None:
+            new_str = ""
+        text = text.replace(old_str, new_str)
+        real.write_text(text)
+        _rebuild_index()
+        return "The memory file has been edited."
+    else:
+        lines = text.splitlines()
+        line_numbers = []
+        for i, line in enumerate(lines):
+            if old_str in line:
+                line_numbers.append(i + 1)
+        return f"No replacement was performed. Multiple occurrences of old_str `{old_str}` in lines: {line_numbers}. Please ensure it is unique"
+
+
+def run_memory_insert(path: str, insert_line: int, insert_text: str) -> str:
+    real = resolve_memory_path(path)
+    if not real.is_file():
+        return f"Error: The path {path} does not exist"
+    if real.name == "MEMORY.md":
+        return f"Error: The path {path} is reserved"
+    lines = real.read_text().splitlines()
+    if insert_line < 0 or insert_line > len(lines):
+        return f"Error: Invalid `insert_line` parameter: {insert_line}. It should be within the range of lines of the file: [0, {len(lines)}]"
+    lines.insert(insert_line, insert_text)
+    real.write_text("\n".join(lines))
+    _rebuild_index()
+    return f"The file {path} has been edited."
+
+
+def run_memory_delete(path: str) -> str:
+    if path == "/memories":
+        return "Error: Cannot delete the root memory directory."
+    real = resolve_memory_path(path)
+    if not real.exists():
+        return f"Error: The path {path} does not exist"
+    if real.name == "MEMORY.md":
+        return f"Error: The path {path} is reserved"
+    if real.is_dir():
+        shutil.rmtree(real)
+    else:
+        real.unlink()
+    _rebuild_index()
+    return f"Successfully deleted {path}"
+
+
+def run_memory_rename(old_path: str, new_path: str) -> str:
+    if old_path == "/memories" or new_path == "/memories":
+        return "Error: Cannot move the root memory directory."
+    old_real = resolve_memory_path(old_path)
+    new_real = resolve_memory_path(new_path)
+    if old_real.name == "MEMORY.md" or new_real.name == "MEMORY.md":
+        return "Error: Cannot move MEMORY.md"
+    if not old_real.exists():
+        return f"Error: The path {old_path} does not exist"
+    if new_real.exists():
+        return f"Error: The destination {new_path} already exists"
+    new_real.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(old_real), str(new_real))
+    _rebuild_index()
+    return f"Successfully renamed {old_path} to {new_path}"
+
+
+def run_memory(command, **kwargs) -> str:
+    try:
+        if command == "view":
+            return run_memory_view(kwargs["path"], kwargs.get("view_range"))
+        elif command == "create":
+            return run_memory_create(kwargs["path"], kwargs["file_text"])
+        elif command == "str_replace":
+            return run_memory_str_replace(
+                kwargs["path"], kwargs["old_str"], kwargs.get("new_str")
+            )
+        elif command == "insert":
+            return run_memory_insert(
+                kwargs["path"], kwargs["insert_line"], kwargs["insert_text"]
+            )
+        elif command == "delete":
+            return run_memory_delete(kwargs["path"])
+        elif command == "rename":
+            return run_memory_rename(kwargs["old_path"], kwargs["new_path"])
+        else:
+            return f"Error: unknown memory command {command}"
+    except (ValueError, TypeError, KeyError) as e:
+        return f"Error: {e!s}"
+
+
+class CompactArgs(BaseModel):
+    focus: str = Field(
+        "", description="What to keep in focus while summarizing (optional)."
+    )
+
+
+def run_compact(focus: str = "") -> str:
+    """占位 handler:compact 实际由 agent_loop 的特判分支处理。
+
+    为什么不能走普通 handler:压缩要【改写 messages 本身】,而 handler 的签名是
+    handler(**args) —— 它只拿得到自己的参数,拿不到会话历史。真正干活的是
+    agent_loop 里 `if tc.function.name == "compact"` 那一支(调 try_compact(force=True),
+    链路 try_compact → compact_history → write_transcript + summarize_history)。
+
+    ⚠️ 为什么不像 09 那样直接把 compact_history 填在这儿:
+        compact_history(msgs) 收的是位置参数 msgs,而这里会以 compact_history(focus=...)
+        被调用 → TypeError。09 里没炸只因为特判在前面拦住了,永远走不到。
+        【填一个"看起来能用其实不能"的函数,比填一个明确的占位更危险】——
+        读代码的人会以为调 compact 就等于执行 compact_history。
+    """
+    return (
+        "[compact] Compaction is handled by the agent loop, not by this tool call. "
+        "If you still see a long history in the next turn, the compaction did not "
+        "trigger — do not call compact again, continue with the task instead."
+    )
+
+
+class SubagentArgs(BaseModel):
+    description: str = Field(
+        ..., description="The self-contained subtask for the subagent to complete."
+    )
+
+
+def spawn_subagent(description: str) -> str:
+    """一次性子代理:全新上下文进去,只带一句总结回来。
+
+    与主干已有的 spawn_teammate 是两种东西,别混:
+        subagent  一次性 / 同步 / 不留状态 / 只回结论      —— s06 的双向保护
+        teammate  长期存活 / 异步线程 / 有 inbox 和协议往返 —— s17 的团队协作
+
+    「双向保护」是它的全部意义:
+        全新 messages  → 保【子】:它的注意力全在这个子任务上,不被主线历史干扰
+        只回结论       → 保【主】:子任务的一堆中间步骤不会灌进主上下文
+
+    ⚠️ 安全:子代理执行工具时【同样要过 PreToolUse】。
+       否则模型被 permission 拦下后,只要 spawn 一个子代理去干同一件事就绕过去了 ——
+       跟「用 bash 绕过 write_file 的路径检查」是同一类漏洞。
+    """
+    # 排除三个:todo_write(主的待办与子无关)、spawn_subagent 与 spawn_teammate
+    # (防止无限套娃 —— SUB_SYSTEM 里也明说了 "Do not delegate further")
+    sub_registry = {
+        name: entry
+        for name, entry in assemble_tool_pool().items()
+        if name not in ("todo_write", "spawn_subagent", "spawn_teammate")
+    }
+    sub_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": entry.description,
+                "parameters": entry.schema,
+            },
+        }
+        for name, entry in sub_registry.items()
+    ]
+
+    messages = [
+        {"role": "system", "content": SUB_SYSTEM},
+        {"role": "user", "content": description},
+    ]
+    print(f"  \033[35m[subagent] start: {description[:60]}\033[0m")
+
+    for _ in range(MAX_SUBAGENT_TURNS):
+        stream = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=sub_tools,
+            tool_choice="auto",
+            stream=True,
+            max_tokens=DEFAULT_MAX_TOKENS,
+        )
+        text, tool_calls, _finish = accumulate_stream(stream)
+        messages.append(build_message(text, tool_calls))
+        calls = [tc for _, tc in sorted(tool_calls.items())]
+        if not calls:
+            print(f"  \033[35m[subagent] done\033[0m")
+            return text  # ← 只把结论交回主 agent
+        for tc in calls:
+            args = json.loads(tc.function.arguments or "{}")
+            blocked = trigger_hook("PreToolUse", tc.function.name, args)
+            result = (
+                f"[Tool '{tc.function.name}' blocked by hook: {blocked}]"
+                if blocked is not None
+                else execute_tool(tc, sub_registry)
+            )
+            messages.append(
+                {"role": "tool", "tool_call_id": tc.id, "content": result}
+            )
+    return "[subagent] 达到最大轮次,子任务未完成"
+
+
+def load_skill(name: str) -> str:
+    """Load full skill content. Lookup via registry — no path traversal."""
+    skill = SKILL_REGISTRY.get(name)
+    if not skill:
+        available = ", ".join(SKILL_REGISTRY) or "(none)"
+        return f"Skill not found: {name!r}, available: {available}"
+    return skill["content"]
 
 
 def run_create_task(
@@ -1761,6 +2683,8 @@ def _make_mcp_handler(client, tool_name):
 
 def assemble_tool_pool() -> dict:
     tools = dict(TOOL_REGISTRY)
+    if MEMORY_MODE != "official":
+        tools.pop("memory", None)
     for server_name, mcp_client in mcp_clients.items():
         safe_server = normalize_mcp_name(server_name)
         for tool_def in mcp_client.tools:
@@ -1900,6 +2824,33 @@ TOOL_REGISTRY = {
         ConnectMCPArgs,
         run_connect_mcp,
     ),
+    "memory": builtin(
+        "All paths MUST start with /memories. To read your memory root, call {'command': 'view', 'path': '/memories'}. Never use read_file for memory paths. "
+        "Your persistent memory directory at /memories. It survives across sessions. "
+        "ALWAYS view /memories before starting a task to check for earlier notes. "
+        "Record important user preferences, facts and progress as you learn them. "
+        "Commands: view (list directory or read file), create (write/overwrite a file), "
+        "str_replace, insert, delete, rename.",
+        MemoryArgs,
+        run_memory,
+    ),
+    "load_skill": builtin(
+        "Load the full content of a skill by name.",
+        SkillsArgs,
+        load_skill,
+    ),
+    "compact": builtin(
+        "Summarize earlier conversation to free context space.",
+        CompactArgs,
+        run_compact,
+    ),
+    "spawn_subagent": builtin(
+        "Delegate a self-contained subtask to a one-shot subagent. "
+        "It starts with a fresh context, does the work, and returns only a summary — "
+        "use it when the subtask would flood your own context with details you don't need.",
+        SubagentArgs,
+        spawn_subagent,
+    ),
 }
 
 # TOOLS = [
@@ -1935,6 +2886,10 @@ def assemble_system_prompt(context: dict) -> str:
     memories = context.get("memories", "")
     if memories:
         sections.append(f"Relevant memories:\n{memories}")
+    if context.get("skills"):
+        sections.append(
+            f"Available skills: {context['skills']}. Use load_skill to read their content."
+        )
 
     return "\n\n".join(sections)
 
@@ -1968,16 +2923,26 @@ def get_system_prompt(context: dict) -> str:
 
 
 def update_context(context: dict, messages: list) -> dict:
-    """Derive context from real state: which tools exist, whether memory files exist."""
+    """Derive context from real state: which tools exist, whether memory files exist.
+
+    分叉点①(记忆层三模式):
+      none      不注入 —— 模型完全不知道有记忆这回事
+      self      系统注入 —— 目前是【全量灌 MEMORY.md】,待升级成相关性筛选
+                (10_memory_loop.py 的 select_relevant_memories / load_memories)
+      official  不注入 —— 模型自己调 memory 工具 view,系统不越俎代庖
+    """
+    global _memories_cache
     memories = ""
-    if MEMORY_INDEX.exists():
-        content = MEMORY_INDEX.read_text().strip()
-        if content:
-            memories = content
+    if MEMORY_MODE == "self":
+        if _memories_cache is None:
+            # 本轮第一次:调 LLM 挑相关记忆,读出【正文】(不是索引摘要)
+            _memories_cache = load_memories(messages)
+        memories = _memories_cache
     return {
         "enabled_tools": list(TOOL_REGISTRY.keys()),  # list(TOOL_HANDLER.keys())
         "workspace": str(WORKDIR),
         "memories": memories,
+        "skills": list_skills(),
     }
 
 
@@ -2097,6 +3062,7 @@ session_history: list | None = None
 def init_session():
     """建立会话初态。只在启动时调用——import 不该建立会话。"""
     global session_context, session_history
+    _scan_skills()
     session_context = update_context({}, [])
     session_history = [
         {"role": "system", "content": get_system_prompt(session_context)}
@@ -2162,8 +3128,41 @@ def build_message(text, tool_calls):
     return msg
 
 
+rounds_since_todo = 0
+MAX_REACTIVE_RETRIES = 1  # retry limit for reactive compact
+MAX_COMPACT_RETRIES = 3  # retry limit for compact_history
+compact_failures = 0
+
+
+def try_compact(msgs, force=False):
+    global compact_failures
+    if estimate_size(msgs) > CONTEXT_LIMIT or force:
+        if compact_failures < MAX_COMPACT_RETRIES:
+            print("[auto-compact]")
+            assert msgs[0]["role"] == "system", "First message must be system prompt"
+            try:
+                msgs[1:] = compact_history(msgs)
+            except Exception as e:
+                print(f"[auto-compact failed: {e}]")
+                compact_failures += 1
+            else:
+                compact_failures = 0
+    return msgs
+
+
+def estimate_size(msgs):
+    return len(str(msgs))
+
+
 def agent_loop(messages: list, context: dict):
     max_turns = 25
+    reactive_retries = 0
+    global compact_failures
+    global rounds_since_todo
+    # 进门先按【当前 messages】重算一次 context:传进来的那份是上一轮末尾算的,
+    # 还不含本轮的 user 消息 —— self 模式下会因此选不出相关记忆(第一轮尤其明显)。
+    # 有 _memories_cache 兜着,这一次不会额外多调 LLM。
+    context = update_context(context, messages)
     # system = get_system_prompt(context)
     system = assemble_system_prompt(context)
     messages[0] = {**messages[0], "content": system}
@@ -2172,30 +3171,94 @@ def agent_loop(messages: list, context: dict):
     #     messages.append({"role": "user", "content": f"[Scheduled] {job.prompt}"})
     #     print(f"  \033[35m[inject cron] {job.prompt[:50]}\033[0m")
     TOOLS_Registry, TOOLS = assemble_tools()
+    state = RecoveryState()
     for turn in range(max_turns):
-        try:
-            reps = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto",
-                stream=True,
+        pre_compress = [dict(m) for m in messages]
+        messages[:] = tool_result_budget(messages)  # L3: persist large results first
+        messages[:] = snip_compact(messages)  # L1: trim middle
+        messages[:] = micro_compact(messages)  # L2: old result placeholders
+        try_compact(messages)  # L4: summarize if too large
+        if rounds_since_todo >= 3 and messages:
+            messages.append(
+                {"role": "user", "content": "<reminder>Update your todos.</reminder>"}
             )
+            rounds_since_todo = 0
+        try:
+            attempt = 0
+
+            def do_request():
+                nonlocal attempt
+                if attempt > 0:
+                    print("\n\033[33m[连接中断,重新生成 —— 上面这段作废]\033[0m\n")
+                attempt += 1
+                stream = client.chat.completions.create(
+                    # 用 state 里的,不是全局 model —— 529 连续三次时 with_retry
+                    # 会把 state.current_model 换成 FALLBACK_MODEL,这里必须跟着走,
+                    # 否则「切换模型」只改了个字段、请求照旧,日志会说谎。
+                    model=state.current_model,
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                    stream=True,
+                    max_tokens=DEFAULT_MAX_TOKENS,
+                )
+                return accumulate_stream(stream)
+
+            text, tool_calls, finish_reason = with_retry(do_request, state)
+            reactive_retries = 0
         except Exception as e:
+            if (
+                "prompt_too_long" in str(e).lower()
+                or "too many tokens" in str(e).lower()
+            ) and reactive_retries < MAX_REACTIVE_RETRIES:
+                print("[reactive compact]")
+                assert messages[0]["role"] == "system", (
+                    "First message must be system prompt"
+                )
+                messages[1:] = reactive_compact(messages)
+                reactive_retries += 1
+                continue
             messages.append(
                 {"role": "assistant", "content": f"[Error] {type(e).__name__}: {e}"}
             )
             return context
         # msg = reps.choices[0].message
         # messages.append(msg.model_dump(exclude_none=True))
-        text, tool_calls, finish_reason = accumulate_stream(reps)
+        # text, tool_calls, finish_reason = accumulate_stream(reps)
+        if finish_reason == "length":
+            messages.append(build_message(text, {}))
+            if state.recovery_count < MAX_RECOVERY_RETRIES:
+                messages.append({"role": "user", "content": CONTINUATION_PROMPT})
+                state.recovery_count += 1
+                print(
+                    f"  \033[33m[max_tokens] continuation"
+                    f" {state.recovery_count}/{MAX_RECOVERY_RETRIES}\033[0m"
+                )
+                continue
+            print("  \033[31m[max_tokens] recovery limit reached\033[0m")
+            return context
         msg = build_message(text, tool_calls)
         messages.append(msg)
         calls = [tc for _, tc in sorted(tool_calls.items())]
         if not calls:
             trigger_hook("Stop", messages)
+            if MEMORY_MODE == "self":
+                extract_memories(pre_compress)
+                consolidate_memories()
             return context
+        rounds_since_todo += 1
         for tc in calls:
+            if tc.function.name == "compact":
+                result = "[auto-compact]"
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result,
+                    }
+                )
+                try_compact(messages, force=True)
+                break
             args = json.loads(tc.function.arguments or "{}")
             blocked = trigger_hook("PreToolUse", tc.function.name, args)
             if blocked is not None:
@@ -2224,6 +3287,8 @@ def agent_loop(messages: list, context: dict):
 
             result = execute_tool(tc, TOOLS_Registry)
             trigger_hook("PostToolUse", tc.function.name, result)
+            if tc.function.name == "todo_write":
+                rounds_since_todo = 0
             messages.append(
                 {
                     "role": "tool",
@@ -2248,6 +3313,13 @@ def agent_loop(messages: list, context: dict):
         messages[0] = {**messages[0], "content": system}
     print("达到最大轮次")
     trigger_hook("Stop", messages)
+    # 【有意】不在这个出口提取记忆(对照上面 if not calls 那个出口),三条理由:
+    #   ① 跑满 max_turns 通常意味着任务卡住了(模型打转/工具一直报错),
+    #      后半段是挣扎,不是用户在表达偏好 —— 提取出来的多半是噪音
+    #   ② 代价不对称:一次失败的工具调用这轮就结束了,但一条【错记忆】会留在
+    #      .memory/ 里影响后续所有对话,而且看起来像条正常记忆,很难发现
+    #   ③ 这里的 pre_compress 是【最后一轮】的快照,早期对话早被 snip_compact
+    #      裁掉了 —— 连完整对话都拿不到,提取的基础本身就是残缺的
     return context
 
 
@@ -2264,6 +3336,8 @@ def print_latest_assistant_text(messages: list):
 
 def run_agent_turn_locked(user_query: str | None = None, cron: bool = False):
     global session_context
+    global _memories_cache
+    _memories_cache = None  # 新一轮用户输入 → 重新挑一次相关记忆
     if user_query is not None:
         trigger_hook("UserPromptSubmit", user_query)
         session_history.append({"role": "user", "content": user_query})
@@ -2310,11 +3384,21 @@ def queue_processor_loop():
 
 def main():
     """启动 agent。原先散在模块顶层的四类副作用全部收在这里。"""
+    global MEMORY_MODE
     parser = argparse.ArgumentParser(description="Run the coding agent.")
     parser.add_argument(
         "task", nargs="?", help="Optional initial task to give the agent."
     )
+    parser.add_argument(
+        "--memory",
+        choices=MEMORY_MODES,
+        default=None,
+        help=f"记忆层模式(默认取环境变量 MEMORY_MODE,当前 {MEMORY_MODE})",
+    )
     args = parser.parse_args()
+    if args.memory:  # CLI 参数优先级最高
+        MEMORY_MODE = args.memory
+    print(f"  \033[36m[memory] mode = {MEMORY_MODE}\033[0m")
     ensure_dirs()
     init_session()
     if args.task:

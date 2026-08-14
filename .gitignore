@@ -28,3 +28,6 @@ wheels/
 # mini-bench 的历次跑分结果(题库 bench/tasks/ 要进仓,成绩单不进)
 bench/runs/
 
+# === 学习用的一次性演示脚本(不是 harness 的一部分) ===
+copy_demo.py
+
