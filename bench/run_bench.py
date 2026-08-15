@@ -33,7 +33,14 @@ SKILLS_SRC = HERE.parent / "skills"  # 技能库真身,发卷时要跟着走(见
 
 run_dir = HERE / "runs" / time.strftime("run_%Y%m%d_%H%M%S")
 
-TIMEOUT_S = 300
+# 🔴 2026-08-15 第一次正式跑的教训:原本 300s,实测超时 34/120 = 28%。
+# 根因不是并行拖慢(实测并行下反而更快:t08 单跑 290s vs 并行中位 247s),
+# 而是 timeout 【正好切在耗时分布的中间偏右】:未超时记录中位 181s、最大 297s ——
+# 只留了 3s 余量。我明明单跑实测过 t08 要 290s,却把 timeout 留在 300s。
+# 🪝 timeout 不是「防死循环的保险丝」那么简单 —— 它同时是一把【采样刀】:
+#    切在分布内部,就会按「跑得快」这个与结果相关的规则筛掉一部分样本,
+#    制造幸存者偏差。它必须设在分布【之外】,而不是分布【之内】。
+TIMEOUT_S = int(os.getenv("BENCH_TIMEOUT", "900"))  # 3 倍中位数,留足尾部
 WORKERS = int(os.getenv("BENCH_WORKERS", "4"))
 TRIALS = int(os.getenv("BENCH_TRIALS", "3"))
 DRY_RUN = os.getenv("BENCH_DRY_RUN") == "1"

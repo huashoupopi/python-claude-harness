@@ -33,8 +33,58 @@ AXES = {
 }
 
 
+TIMEOUT_ALARM = 0.10  # 超时率超过这个数,整批数据的可信度就要打问号
+
+
 def load(path: Path) -> list[dict]:
     return [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+
+def split_timeouts(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """把超时记录【隔离出去】,不许混进任何统计。
+
+    🔴 2026-08-15 第一次正式跑的教训:120 单元超时 34 次(28%),而
+      ① 超时记录的 tokens_total 全是 0 —— 进程被 kill,.bench_trace.json 没写成。
+         把 0 混进均值,等于往每个臂的成本里掺水,而且掺的量还各不相同。
+      ② 更致命的是【幸存者偏差】:超时在各臂严重不均(mem_self 12 次、mem_none 3 次),
+         于是 mem_self 只剩 12 个样本,【而且全是跑得快的那些】——
+         它的 steps 看起来最低,那是被 kill 掉慢样本之后的假象。
+      ③ 27/34 的超时记录 success=True —— 它们只是【慢】,不是【做不出来】。
+         按「失败」处理同样是错的。
+    🪝 被截断的样本不是「缺了几条数据」,是「按某个与结果相关的规则筛过一遍的数据」——
+       它比没有数据更危险,因为它看起来像数据。
+    """
+    ok = [r for r in rows if not r["timed_out"]]
+    to = [r for r in rows if r["timed_out"]]
+    return ok, to
+
+
+def timeout_report(rows: list[dict], to: list[dict]) -> bool:
+    """先报超时,再谈别的。返回值:这批数据可不可信。"""
+    rate = len(to) / len(rows) if rows else 0
+    print("\n" + "=" * 78)
+    print(f"⏱ 超时 {len(to)}/{len(rows)} = {rate:.0%}")
+    print("=" * 78)
+    if not to:
+        print("  ✅ 无超时,全部样本进入统计")
+        return True
+    from collections import Counter
+
+    print(f"  按题: {Counter(r['task'] for r in to).most_common()}")
+    print(f"  按臂: {Counter(r['config'] for r in to).most_common()}")
+    print(f"  其中 success=True 的 {sum(1 for r in to if r['success'])} 条 —— 它们只是慢,不是做不出来")
+    per_cfg = Counter(r["config"] for r in to)
+    if rate >= TIMEOUT_ALARM:
+        print(
+            f"\n  🔴🔴 超时率 ≥ {TIMEOUT_ALARM:.0%},【这批数据不可用于归因】。\n"
+            "     不是「少了几条」,而是【幸存者偏差】:超时在各臂不均"
+            f"({dict(per_cfg)}),\n"
+            "     剩下的样本是「跑得快的那些」,臂间比较的是被不同规则筛过的两拨样本。\n"
+            "     处置:调大 timeout 重跑,别在这批上做结论。"
+        )
+        return False
+    print(f"\n  ⚠️ 超时率 {rate:.0%} < {TIMEOUT_ALARM:.0%},下面的统计已【排除】超时记录。")
+    return True
 
 
 def fmt(x, w=7, p=1):
@@ -172,11 +222,29 @@ def main():
     )
     rows = load(path)
     print(f"\n数据源: {path}   共 {len(rows)} 条记录")
-    block_noise(rows)
-    block_summary(rows)
+
+    # 🔴 顺序有意义:先判定这批数据可不可信,再谈统计。
+    #    反过来的话,读的人会先看到一堆漂亮数字,再看到「其实不可信」——
+    #    而人对先看到的数字有锚定,警告放后面就晚了。
+    ok, to = split_timeouts(rows)
+    trustworthy = timeout_report(rows, to)
+    block_anomalies(rows)  # 异常清单看全量(超时本身就是异常)
+
+    if not trustworthy:
+        print(
+            "\n" + "=" * 78
+            + "\n⛔ 因超时率过高,跳过统计部分 —— 在有偏样本上算出来的均值和 p 值,"
+            "\n   比没有数字更有害:它们看起来像结论。"
+            "\n   (要强行看请传 --force)"
+        )
+        if "--force" not in sys.argv:
+            return
+        print("\n⚠️ --force:以下数字建立在有偏样本上,不得用于任何结论。\n")
+
+    block_noise(ok)
+    block_summary(ok)
     for metric in ("steps", "tokens_total"):
-        block_paired(rows, metric)
-    block_anomalies(rows)
+        block_paired(ok, metric)
     print(
         "\n" + "=" * 78
         + "\n⚠️ 口径限制(讲结论时要带上):配对单位是(题, trial),但同一题的 3 个 trial"
