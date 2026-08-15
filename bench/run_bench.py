@@ -48,8 +48,8 @@ DRY_RUN = os.getenv("BENCH_DRY_RUN") == "1"
 # 跑一次 dry-run 再跑分析,它就会去分析那批「完美考生」的假数据(全 8/8、steps 全 0)。
 # 我自己就这么扫错过一次:ls -td 拿到最新目录,那是演习,还以为是全部。
 # 🪝 名字取对了,逻辑就不用写过滤 —— analyze.py 的 glob("run_*") 自动跳过 dryrun_*。
-run_dir = HERE / "runs" / time.strftime(
-    ("dryrun_" if DRY_RUN else "run_") + "%Y%m%d_%H%M%S"
+run_dir = (
+    HERE / "runs" / time.strftime(("dryrun_" if DRY_RUN else "run_") + "%Y%m%d_%H%M%S")
 )
 # 沙箱:默认【开】—— 与主干相反,这是有意的。
 # 主干默认 off 是因为「加功能不能改变原有行为」;而 bench 是【无人看守的批量跑】,
@@ -58,7 +58,8 @@ run_dir = HERE / "runs" / time.strftime(
 SANDBOX = os.getenv("BENCH_SANDBOX", "1") == "1"
 DELETIONS = "_deletions.txt"  # solution/ 里的特殊文件,见 verify_tasks.py
 
-# 🔴🔴 TODO(下次开跑前必做):把 solution/ 在跑之前临时改名藏起来,try/finally 恢复。
+# ✅ 2026-08-15 已修(实现在文件末尾「🔒 藏答案」那段):跑之前把 solution/ 移出项目树,
+#    try/finally 还回去。以下是案发记录,保留。
 # 2026-08-15 实测泄漏 2/120:模型做不出题(48 次 write_file 仍不过),掉头去查评测系统,
 # 找到 bench/tasks/<题>/solution/ 直接 cat 了标准答案,日志里自己写着「已对齐 solution」。
 # ⚠️ 建 solution/ 时明确想过「它不会进考场」—— 但那只防住了 copytree,没防住 bash。
@@ -163,10 +164,13 @@ def restore_tests(task_dir: Path, repo: Path) -> list[str]:
     tampered = sorted(
         p.name
         for p in originals
-        if not (repo / p.name).exists() or (repo / p.name).read_bytes() != p.read_bytes()
+        if not (repo / p.name).exists()
+        or (repo / p.name).read_bytes() != p.read_bytes()
     )
     extra = sorted(
-        p.name for p in repo.glob("test_*.py") if p.name not in {o.name for o in originals}
+        p.name
+        for p in repo.glob("test_*.py")
+        if p.name not in {o.name for o in originals}
     )
     for stale in repo.glob("test_*.py"):
         stale.unlink()
@@ -321,7 +325,8 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
         # 超时被 kill 那次,这里是【唯一】会执行的清理。
         subprocess.run(
             ["docker", "rm", "-f", f"harness-sbx-{sbx_tag}"],
-            capture_output=True, timeout=60,
+            capture_output=True,
+            timeout=60,
         )
 
     steps = out.count("[tool call]")
@@ -420,12 +425,39 @@ print(
     f"{len(units) // (len(CONFIGS) * TRIALS)} 题,并发 {WORKERS},输出 {run_dir}"
 )
 
-results = []
-t0 = time.time()
-with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-    futures = [ex.submit(run_one, *u) for u in units]
-    for fut in as_completed(futures):
-        results.append(fut.result())
+# 🔒 藏答案:跑之前把 solution/ 整个移出项目树,跑完还回去(泄漏的第二道锁,见 §61)。
+# ⚠️ 必须在 EXPECTED 算完【之后】—— expected_total() 要跑一遍标准答案才知道满分几条。
+# ⚠️ dry-run 不藏 —— 演习模式拿 solution 当"完美考生",藏了冒烟闸当场报废。
+# ⚠️ 只在这里藏【一次】,不能写进 run_one:那是 4 路并发,会互相抢同一个目录。
+# 📌 移到项目【外面】(/tmp)而不是换个角落:这道锁只在 BENCH_SANDBOX=0 时才起作用,
+#    而那时模型的 bash 裸跑在宿主机上,cd .. 哪都能去 —— 藏在项目里挡不住会 find 的它。
+#    丢了也不怕:21 个答案文件都在 git 里,git checkout 就回来。
+# 📌 try 从【藏之前】就开始:搬到第 5 个出错的话,前 4 个也得还回去。
+#    finally 照着 hidden 走(而不是照着"应该有 8 个"),所以搬了一半也能正确还原。
+# 🔴 不写 except —— 跑批崩了数据就是残的,没有别的应对方式。
+#    吞掉异常的后果是脚本继续往下跑,拿一批残缺 results 打出一张看起来正常的成绩单。
+#    🪝 同族:keep_worktree 返回「已保留」而其实没有(2026-08-15 扫描)。工具返回
+#       【假成功】比返回错误更糟 —— 它会被当成事实继续用下去。
+hidden = []
+try:
+    if not DRY_RUN:
+        stash = Path(tempfile.mkdtemp(prefix="bench-sol_"))
+        for td in sorted(TASKS_DIR.iterdir()):
+            sol = td / "solution"
+            if sol.is_dir():
+                dest = stash / td.name
+                shutil.move(sol, dest)
+                hidden.append([sol, dest])
+
+    results = []
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futures = [ex.submit(run_one, *u) for u in units]
+        for fut in as_completed(futures):
+            results.append(fut.result())
+finally:
+    for sol, dest in hidden:
+        shutil.move(dest, sol)
 
 # 成绩单:每个臂一行 N/M,外加需要人看一眼的异常
 print(f"\n=== 成绩单 ({time.time() - t0:.0f}s) ===")
@@ -435,7 +467,7 @@ for name in CONFIGS:
         continue
     n = len(rows)
     full = sum(1 for r in rows if r["success"])
-    avg = lambda k: sum(r[k] for r in rows) / n  # noqa: E731
+    avg = lambda k: sum(r[k] for r in rows) / n
     print(
         f"  {name:14s} 全过 {full}/{n}   "
         f"平均通过率 {avg('pass_rate'):.2f}   "
