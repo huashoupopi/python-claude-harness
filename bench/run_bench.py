@@ -31,8 +31,6 @@ TASKS_DIR = HERE / "tasks"
 RUNNER = HERE / "agent_runner.py"
 SKILLS_SRC = HERE.parent / "skills"  # 技能库真身,发卷时要跟着走(见 ① 处)
 
-run_dir = HERE / "runs" / time.strftime("run_%Y%m%d_%H%M%S")
-
 # 🔴 2026-08-15 第一次正式跑的教训:原本 300s,实测超时 34/120 = 28%。
 # 根因不是并行拖慢(实测并行下反而更快:t08 单跑 290s vs 并行中位 247s),
 # 而是 timeout 【正好切在耗时分布的中间偏右】:未超时记录中位 181s、最大 297s ——
@@ -44,6 +42,15 @@ TIMEOUT_S = int(os.getenv("BENCH_TIMEOUT", "900"))  # 3 倍中位数,留足尾�
 WORKERS = int(os.getenv("BENCH_WORKERS", "4"))
 TRIALS = int(os.getenv("BENCH_TRIALS", "3"))
 DRY_RUN = os.getenv("BENCH_DRY_RUN") == "1"
+
+# 🔴 2026-08-15:演习和实弹的目录名要分开。
+# 踩过的坑:两者混在 runs/ 里,而 analyze.py 默认取【最新那批】——
+# 跑一次 dry-run 再跑分析,它就会去分析那批「完美考生」的假数据(全 8/8、steps 全 0)。
+# 我自己就这么扫错过一次:ls -td 拿到最新目录,那是演习,还以为是全部。
+# 🪝 名字取对了,逻辑就不用写过滤 —— analyze.py 的 glob("run_*") 自动跳过 dryrun_*。
+run_dir = HERE / "runs" / time.strftime(
+    ("dryrun_" if DRY_RUN else "run_") + "%Y%m%d_%H%M%S"
+)
 # 沙箱:默认【开】—— 与主干相反,这是有意的。
 # 主干默认 off 是因为「加功能不能改变原有行为」;而 bench 是【无人看守的批量跑】,
 # 2026-08-15 正是在这里被泄漏了 2/120(模型跑出考场 cat 了 solution/)。

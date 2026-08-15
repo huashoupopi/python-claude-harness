@@ -148,3 +148,109 @@ def test_micro_compact_short_results_untouched(trunk):
     for k in range(6):
         result_msg = out[3 + 2 * k]  # 第 k 对的结果
         assert result_msg["content"] == "short"
+
+
+def _tool_call_chunk(trunk_mod, calls):
+    """造一片带多个 tool_call 的假 chunk(calls: [(id, name, args_json), ...])。"""
+    from openai.types.chat import ChatCompletionChunk
+
+    return ChatCompletionChunk.model_validate(
+        {
+            "id": "chatcmpl-fake",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "fake",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "index": i,
+                                "id": cid,
+                                "type": "function",
+                                "function": {"name": name, "arguments": args},
+                            }
+                            for i, (cid, name, args) in enumerate(calls)
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        }
+    )
+
+
+def _text_chunk(text="done"):
+    from openai.types.chat import ChatCompletionChunk
+
+    return ChatCompletionChunk.model_validate(
+        {
+            "id": "chatcmpl-fake",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "fake",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+    )
+
+
+def test_compact_plus_other_tools_leaves_no_orphan(sandbox, monkeypatch):
+    """🔴 compact 和别的工具【同一轮】被调用时,不许留孤儿。
+
+    2026-08-15 人工扫描发现的漏:agent_loop 里 compact 那一支处理完就 break,
+    后面的 tool_call 永远轮不到执行 —— 它们的 tool_call_id 没有对应回复 = 孤儿,
+    下一轮请求 API 直接 400。
+    ⚠️ break 本身是对的(try_compact 会重写整个历史,压缩后再往上贴位置就乱了);
+       错的是止损时没给剩下的调用一个交代。
+
+    实测:两批共 240 次跑批里模型一次都没调过 compact —— 这个 bug 从未被触发。
+    但它的触发条件是「对话长到需要压缩」,恰恰是最不该崩的时候。
+    🪝 没触发过 ≠ 不存在;测试要覆盖【最坏的时候】,不是【常见的时候】。
+    """
+    trunk = sandbox
+    rounds = []
+
+    def fake_create(**kwargs):
+        rounds.append(kwargs)
+        if len(rounds) == 1:
+            # 第一轮:模型一次要调两个工具 —— compact 排在前面
+            return iter(
+                [
+                    _tool_call_chunk(
+                        trunk,
+                        [
+                            ("call_compact", "compact", "{}"),
+                            ("call_read", "read_file", '{"path": "x.txt"}'),
+                        ],
+                    )
+                ]
+            )
+        return iter([_text_chunk()])  # 第二轮:说句话就结束
+
+    monkeypatch.setattr(trunk.client.chat.completions, "create", fake_create)
+    monkeypatch.setattr(trunk, "MEMORY_MODE", "none")  # 别去调记忆提取
+    monkeypatch.setattr(trunk, "compact_history", lambda msgs: msgs[1:])  # 压缩本身不是重点
+
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "干活"},
+    ]
+    trunk.agent_loop(messages, {})
+
+    calls, results = collect_pairs(messages)
+    assert calls == results, (
+        f"有孤儿!发起了 {len(calls)} 个调用,只有 {len(results)} 个有结果。"
+        f"缺的是: {calls - results}"
+    )
+    # 而且被跳过的那个必须收到【说明原因】的回复,不能是空的 —— 错误消息就是 prompt
+    skipped = [m for m in messages if m.get("tool_call_id") == "call_read"]
+    assert skipped and "compacted" in skipped[0]["content"].lower()

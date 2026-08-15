@@ -117,3 +117,24 @@ def test_retry_delay_grows_and_has_jitter(trunk):
 def test_retry_after_takes_priority(trunk):
     """服务端给了 Retry-After 就听它的,不用自己算。"""
     assert trunk.retry_delay(5, retry_after=7) == 7
+
+
+def test_prompt_too_long_detector_covers_openai_wording(trunk):
+    """🔴 「上下文超长」的识别必须覆盖各家的措辞,尤其是 OpenAI 那种。
+
+    2026-08-15 人工扫描发现:is_prompt_too_long_error 写好了却【一次都没被调用】,
+    agent_loop 里用的是另一段手写判断,只认 "prompt_too_long" 和 "too many tokens"。
+    而 OpenAI 兼容接口报的是 "context_length_exceeded" —— 手写那版认不出来,
+    于是上下文塞满时本该自动压缩重试,实际会直接报错退出。
+    🪝 同一件事有两处实现、其中一处没人用 —— 用的那处迟早比另一处旧。
+    """
+    for msg in (
+        "Error code: 400 - context_length_exceeded",  # OpenAI 兼容接口(我们现在用的)
+        "prompt is too long: 250000 tokens > 200000",  # Anthropic
+        "prompt_is_too_long",
+        "max_context_window exceeded",
+    ):
+        assert trunk.is_prompt_too_long_error(Exception(msg)), f"没认出来: {msg}"
+
+    for msg in ("connection reset", "429 rate limit", "invalid api key"):
+        assert not trunk.is_prompt_too_long_error(Exception(msg)), f"误判了: {msg}"

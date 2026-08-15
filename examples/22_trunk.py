@@ -149,6 +149,12 @@ SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "harness-sandbox:1")
 # bench 跑批时【显式】设 none:那是无人看守的批量跑,最怕数据被发出去。
 # 🪝 又一次「默认值 = 最少惊讶的那个」—— 这个开关差点重蹈 TODO_MODE 的覆辙。
 SANDBOX_NETWORK = os.getenv("SANDBOX_NETWORK", "bridge")
+# 工作区里【不许让盒子看见】的文件。2026-08-15 实测:.env 就躺在工作区里,
+# agent 一句 `cat .env` 就读到 API key —— 沙箱也挡不住,因为它在挂载范围【内】。
+# 做法是拿 /dev/null 盖在它上面:盒子里那个文件存在但是空的。
+# ⚠️ 这只在沙箱【开着】时有效。关着时 agent 直接在宿主机跑,照样读得到 ——
+#    那一档的防线是「你人在旁边看着」,跟 SANDBOX_MODE 默认 off 是同一个道理。
+SANDBOX_HIDE = (".env", ".env.local", ".netrc", "id_rsa")
 _sandbox_name: str | None = None
 
 
@@ -316,7 +322,15 @@ def write_memory_file(name: str, mem_type: str, description: str, body: str):
 
 
 def read_memory_index() -> str:
-    """Read MEMORY.md index (injected into SYSTEM every turn)."""
+    """Read MEMORY.md index (injected into SYSTEM every turn).
+
+    ⚠️ 【主干里已无人调用】(2026-08-15 人工扫描确认),保留作历史记录。
+    散件 10_memory_loop.py 的 build_system 每轮把【整个索引】塞进 system prompt;
+    主干改成了 load_memories —— 调一次 LLM 只挑相关的几条,更精细也更省 token。
+    这是从散件搬进主干时留下的孤儿。
+    🪝 留着它是为了记住「这里曾经的做法」;但既然没人用,就必须写清楚,
+       否则下一个读代码的人会以为索引还在被注入。
+    """
     if not MEMORY_INDEX.exists():
         return ""
     text = MEMORY_INDEX.read_text().strip()
@@ -2029,17 +2043,21 @@ def start_sandbox() -> str:
     tag = os.getenv("SANDBOX_TAG") or f"{os.getpid()}-{int(time.time())}"
     name = f"harness-sbx-{tag}"
     subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=60)  # 同名残留先清
-    subprocess.run(
-        [
-            "docker", "run", "-d", "--name", name,
-            "-v", f"{WORKDIR}:{WORKDIR}",
-            "-w", str(WORKDIR),
-            "--network", SANDBOX_NETWORK,
-            "--memory", "1g", "--cpus", "2",
-            SANDBOX_IMAGE,
-        ],
-        capture_output=True, text=True, check=True, timeout=60,
-    )
+    args = [
+        "docker", "run", "-d", "--name", name,
+        "-v", f"{WORKDIR}:{WORKDIR}",
+        "-w", str(WORKDIR),
+        "--network", SANDBOX_NETWORK,
+        "--memory", "1g", "--cpus", "2",
+    ]
+    # 敏感文件:用 /dev/null 盖住,盒子里读到的是空的。
+    # ⚠️ 只盖【真实存在】的:不判断的话 docker 会替你把它创建出来,
+    #    于是每个考场里凭空多一个空 .env —— 那会污染 bench 的改动统计。
+    for f in SANDBOX_HIDE:
+        if (WORKDIR / f).exists():
+            args += ["-v", f"/dev/null:{WORKDIR / f}:ro"]
+    args.append(SANDBOX_IMAGE)
+    subprocess.run(args, capture_output=True, text=True, check=True, timeout=60)
     _sandbox_name = name
     return name
 
@@ -3358,10 +3376,17 @@ def agent_loop(messages: list, context: dict):
                 TOKEN_USAGE["total"] += usage.total_tokens
             reactive_retries = 0
         except Exception as e:
+            # 🔴 2026-08-15 修:原来这里是手写的两个关键词判断
+            #      "prompt_too_long" / "too many tokens"
+            #    而上面 274 行【早就写好了】is_prompt_too_long_error,一次都没被调用。
+            #    两者的差别是致命的:手写版认不出 "context_length_exceeded" ——
+            #    那正是【OpenAI 兼容接口】报的错,也就是我们现在用的这个端点。
+            #    后果:上下文塞满时本该自动压缩重试,实际会直接报错退出。
+            # 🪝 同一件事有两处实现,其中一处没人用 —— 用的那处迟早比另一处旧。
             if (
-                "prompt_too_long" in str(e).lower()
-                or "too many tokens" in str(e).lower()
-            ) and reactive_retries < MAX_REACTIVE_RETRIES:
+                is_prompt_too_long_error(e)
+                and reactive_retries < MAX_REACTIVE_RETRIES
+            ):
                 print("[reactive compact]")
                 assert messages[0]["role"] == "system", (
                     "First message must be system prompt"
@@ -3409,6 +3434,27 @@ def agent_loop(messages: list, context: dict):
                     }
                 )
                 try_compact(messages, force=True)
+                # 🔴 2026-08-15 补:break 之前必须给【剩下的每个工具调用】都回一条。
+                # 为什么会漏:模型一次可以返回多个 tool_call,而 compact 一压缩就 break,
+                # 后面那些调用永远轮不到 → 它们的 tool_call_id 没有对应回复 = 孤儿
+                # → 下一轮请求 API 直接 400。
+                # ⚠️ break 本身是对的、不能改成 continue:try_compact 会【重写整个历史】,
+                #    压缩之后再往上贴工具结果,位置关系就乱了。break 是及时止损 ——
+                #    错的只是止损时没给剩下的调用一个交代。
+                # 📌 回复内容写明原因(而不是塞个空的 [skipped]):错误消息就是 prompt,
+                #    模型知道「上下文刚压过」才会重新评估,否则它只会原样再调一遍。
+                for skipped in calls[calls.index(tc) + 1 :]:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": skipped.id,
+                            "content": (
+                                "[skipped] Context was just compacted, so the remaining "
+                                "tool calls in this turn were not executed. "
+                                "Re-evaluate with the compacted history before calling again."
+                            ),
+                        }
+                    )
                 break
             args = json.loads(tc.function.arguments or "{}")
             blocked = trigger_hook("PreToolUse", tc.function.name, args)
@@ -3513,6 +3559,9 @@ def run_agent_turn_locked(user_query: str | None = None, cron: bool = False):
         session_history.append({"role": "user", "content": f"[Inbox]\n{inbox_text}"})
         print(f"\n\033[33m[Inbox: {len(inbox_msgs)} messages injected]\033[0m")
     # print_latest_assistant_text(session_history)
+    # ↑ 有意注释掉,不是漏:T20 改流式之后,模型说的话已经一个字一个字打在屏幕上了,
+    #   再打印一遍就是同一段话来两遍。
+    # 🪝 注释掉一行代码时要写明【为什么】—— 否则下次有人会当成漏而"修好"它。
     print()
 
 

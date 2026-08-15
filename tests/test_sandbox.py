@@ -175,3 +175,48 @@ def test_stop_sandbox_is_idempotent(trunk):
     trunk._sandbox_name = None
     trunk.stop_sandbox()  # 不抛异常即通过
     trunk.stop_sandbox()  # 连调两次也不行出错
+
+
+@needs_docker
+def test_sandbox_hides_secrets(trunk, tmp_path, monkeypatch):
+    """🔴 API key 不许被盒子读到 —— 但它就躺在工作区里,沙箱的挂载范围【内】。
+
+    2026-08-15 实测发现:WORKDIR 是项目根,.env 就在那儿,
+    agent 一句 `cat .env` 就读到 key,【沙箱开着也一样】——
+    因为隔离挡的是「工作区外面」,而 .env 在里面。
+    🪝 隔离画的是一条线,线【里面】的东西它一概不管 —— 别把「装了沙箱」当成「安全了」。
+
+    做法:拿 /dev/null 盖在这些文件上,盒子里它们存在但是空的。
+    """
+    monkeypatch.setattr(trunk, "WORKDIR", tmp_path)
+    monkeypatch.setattr(trunk, "SANDBOX_MODE", "docker")
+    monkeypatch.setattr(trunk, "_sandbox_name", None)
+    (tmp_path / ".env").write_text("API_KEY=sk-super-secret-value\n")
+    (tmp_path / "normal.txt").write_text("这是普通文件,不该被盖住\n")
+    try:
+        assert "sk-super-secret" not in trunk.run_bash("cat .env")
+        assert "空的" in trunk.run_bash("test -s .env && echo 有内容 || echo 空的")
+        # 反面:普通文件不许被误伤 —— 盖太多等于把工作区废了
+        assert "这是普通文件" in trunk.run_bash("cat normal.txt")
+    finally:
+        trunk.stop_sandbox()
+    # 宿主机上的真文件必须完好 —— 盖住的只是盒子里的视图,不是把你的 .env 清空了
+    assert "sk-super-secret-value" in (tmp_path / ".env").read_text()
+
+
+@needs_docker
+def test_hiding_does_not_create_missing_files(trunk, tmp_path, monkeypatch):
+    """⚠️ 只盖【真实存在】的文件。
+
+    docker 遇到不存在的挂载路径会【自动创建】它 —— 不判断的话,
+    每个考场里都会凭空多出一个空 .env,污染 bench 的「改动了几行」统计。
+    """
+    monkeypatch.setattr(trunk, "WORKDIR", tmp_path)
+    monkeypatch.setattr(trunk, "SANDBOX_MODE", "docker")
+    monkeypatch.setattr(trunk, "_sandbox_name", None)
+    assert not (tmp_path / ".env").exists()
+    try:
+        trunk.run_bash("echo hi")
+    finally:
+        trunk.stop_sandbox()
+    assert not (tmp_path / ".env").exists(), "凭空造出了一个 .env —— 会污染考场"
