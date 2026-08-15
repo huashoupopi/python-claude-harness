@@ -3552,23 +3552,32 @@ def main():
     print(f"  \033[36m[memory] mode = {MEMORY_MODE}\033[0m")
     ensure_dirs()
     init_session()
-    if args.task:
-        with agent_lock:
-            run_agent_turn_locked(args.task)
-        return
-    start_cron_scheduler()
-    print("输入一个问题，回车发送。输入q退出。\n")
-    threading.Thread(target=queue_processor_loop, daemon=True).start()
-    print("  \033[35m[queue processor] started\033[0m")
-    while True:
-        try:
-            user_input = input(">>> ")
-        except (EOFError, KeyboardInterrupt):
-            break
-        if user_input.strip().lower() in ["q", "quit", "exit"]:
-            break
-        with agent_lock:
-            run_agent_turn_locked(user_input)
+    # 🔴 2026-08-15 当事人读代码时抓到的漏:stop_sandbox 写了,但主干【自己没调】——
+    # bench 那条路有 agent_runner + run_bash 两处收尸,测试有 fixture 收尸,
+    # 唯独你在 REPL 里用完退出时没人拆,容器会一直留着。
+    # ⚠️ main 有【三个出口】:一次性模式 return、输入 q break、Ctrl-C 的 break。
+    #    所以不能在某一处补,只能用 try/finally 把三个出口一起兜住。
+    # 🪝 「函数写了」和「函数在所有退出路径上都被调到」是两件事。
+    try:
+        if args.task:
+            with agent_lock:
+                run_agent_turn_locked(args.task)
+            return
+        start_cron_scheduler()
+        print("输入一个问题，回车发送。输入q退出。\n")
+        threading.Thread(target=queue_processor_loop, daemon=True).start()
+        print("  \033[35m[queue processor] started\033[0m")
+        while True:
+            try:
+                user_input = input(">>> ")
+            except (EOFError, KeyboardInterrupt):
+                break
+            if user_input.strip().lower() in ["q", "quit", "exit"]:
+                break
+            with agent_lock:
+                run_agent_turn_locked(user_input)
+    finally:
+        stop_sandbox()  # SANDBOX_MODE=off 时 _sandbox_name 是 None,这里直接返回,无害
 
 
 if __name__ == "__main__":

@@ -165,3 +165,13 @@ def test_without_sandbox_the_escape_actually_works(trunk, tmp_path, monkeypatch)
     assert outside.exists(), "不开沙箱居然也没写成功?那上面两条测的就不是沙箱"
     assert "pwned" in outside.read_text()
     outside.unlink()
+
+
+def test_stop_sandbox_is_idempotent(trunk):
+    """没有容器时调 stop_sandbox 不许报错 —— 它被放在 finally 里,
+    而 finally 是【任何情况都会跑】的地方,包括「压根没开过沙箱」那种情况。
+    🪝 收尾函数必须能在「没什么可收」的时候安静返回。
+    """
+    trunk._sandbox_name = None
+    trunk.stop_sandbox()  # 不抛异常即通过
+    trunk.stop_sandbox()  # 连调两次也不行出错
