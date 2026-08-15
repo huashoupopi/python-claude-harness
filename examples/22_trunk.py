@@ -1039,7 +1039,10 @@ def remove_worktree(name: str, discard_changes: bool = False) -> str:
     """Remove worktree. Refuses if uncommitted changes unless discard_changes."""
     err = validate_worktree_name(name)
     if err:
-        return err
+        # 2026-08-15:三个 worktree 函数对同一种错误统一加 "Error: " 前缀
+        # (原来 create 带、remove/keep 不带)。错误消息是给【模型】看的,
+        # 格式一致它才容易识别「这是一次失败」而不是一句普通输出。
+        return f"Error: {err}"
     path = WORKTREES_DIR / name
     if not path.exists():
         return f"Worktree '{name}' not found"
@@ -1070,7 +1073,14 @@ def keep_worktree(name: str) -> str:
     """Keep worktree for manual review. Branch preserved."""
     err = validate_worktree_name(name)
     if err:
-        return err
+        return f"Error: {err}"
+    # 🔴 2026-08-15 补:原来【不检查存在性】—— keep 一个根本不存在的 worktree,
+    #    照样回一句「已保留」。工具返回假成功比返回错误更糟:模型会拿它当事实继续往下走。
+    #    同族的 remove_worktree 检查了,create_worktree 也检查了,只有它没有。
+    # 🪝 同族函数写法不一致就是漏的温床 —— 今天第三次撞见这个形状
+    #    (run_claim_task 缺 try、两份黑名单、这次)。
+    if not (WORKTREES_DIR / name).exists():
+        return f"Worktree '{name}' not found"
     log_event("keep", name)
     print(f"  \033[36m[worktree] kept: {name}\033[0m")
     return f"Worktree '{name}' kept for review (branch: wt/{name})"
@@ -1681,7 +1691,19 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                             }
                         )
                 if len(messages) > 20:
-                    messages = [messages[0]] + messages[-20:]
+                    # 🔴 2026-08-15 修:原来是裸切 messages[-20:] ——
+                    #    切口万一落在「工具结果」上,它对应的 assistant 调用就被切掉了,
+                    #    留下一条没主人的结果 = 孤儿 → 下一次请求 API 400。
+                    #    主循环的 snip_compact 早就有这道保护(见 :610),teammate 这条线漏了。
+                    # 🪝 同一个坑在两条线上,只有一条设了防 —— 复制粘贴时最容易丢的
+                    #    就是这种「看起来无关紧要的三行」。
+                    cut = len(messages) - 20
+                    while cut < len(messages) and _is_tool_result_message(messages[cut]):
+                        cut -= 1  # 退回到发起调用的那条 assistant 上
+                        if cut <= 1:  # 退到头了就别退了(messages[0] 是 system)
+                            cut = 1
+                            break
+                    messages = [messages[0]] + messages[max(cut, 1) :]
                 try:
                     response = client.chat.completions.create(
                         model=model,

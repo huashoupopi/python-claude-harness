@@ -254,3 +254,62 @@ def test_compact_plus_other_tools_leaves_no_orphan(sandbox, monkeypatch):
     # 而且被跳过的那个必须收到【说明原因】的回复,不能是空的 —— 错误消息就是 prompt
     skipped = [m for m in messages if m.get("tool_call_id") == "call_read"]
     assert skipped and "compacted" in skipped[0]["content"].lower()
+
+
+def test_teammate_truncation_keeps_pairs(trunk):
+    """🔴 teammate 的历史截断不许把「调用」和「结果」切散。
+
+    2026-08-15 扫描发现:teammate 那条线是裸切 messages[-20:],
+    切口万一落在【工具结果】上,它对应的 assistant 调用就被切掉了 = 孤儿 → API 400。
+    主循环的 snip_compact 早有这道保护(:610),teammate 漏了。
+    🪝 同一个坑在两条线上,只有一条设了防 —— 复制粘贴时最容易丢的就是这种
+       「看起来无关紧要的三行」。
+
+    ⚠️ 这条用例是【精心构造】的:必须让 msgs[len-20] 正好落在 tool 上。
+       随手构造(每对 2 条)时切口永远落在 assistant 上,两种写法都"零孤儿" ——
+       看起来像修好了,其实压根没进那个 if。
+    🪝 构造测试用例时得先确认它真的走到了要测的那条分支。
+    """
+    msgs = [
+        {"role": "system", "content": "s"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "c0", "type": "function", "function": {"name": "x", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c0", "content": "r"},
+    ]
+    for i in range(1, 10):
+        msgs.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": f"c{i}",
+                        "type": "function",
+                        "function": {"name": "x", "arguments": "{}"},
+                    }
+                ],
+            }
+        )
+        msgs.append({"role": "tool", "tool_call_id": f"c{i}", "content": "r"})
+    msgs.append({"role": "user", "content": "再来"})
+
+    assert msgs[len(msgs) - 20]["role"] == "tool", "用例失效:切口没落在工具结果上"
+
+    # 裸切(改之前的写法)——先证明这个坑是真的
+    naive_calls, naive_results = collect_pairs([msgs[0]] + msgs[-20:])
+    assert naive_results - naive_calls, "裸切居然没造出孤儿?那这条测试就没意义了"
+
+    # 改后:退回到发起调用的那条 assistant
+    cut = len(msgs) - 20
+    while cut < len(msgs) and trunk._is_tool_result_message(msgs[cut]):
+        cut -= 1
+        if cut <= 1:
+            cut = 1
+            break
+    calls, results = collect_pairs([msgs[0]] + msgs[max(cut, 1) :])
+    assert results <= calls, f"还有孤儿: {results - calls}"

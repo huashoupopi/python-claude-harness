@@ -176,3 +176,36 @@ def test_task_tools_report_missing_task_uniformly(sandbox):
     for fn in (sandbox.run_get_task, sandbox.run_claim_task, sandbox.run_complete_task):
         out = fn("no_such_task")
         assert "not found" in out.lower(), f"{fn.__name__} 没给出「找不到」的交代: {out!r}"
+
+
+# ---------- worktree 三兄弟(T21 扫描) ----------
+
+
+def test_keep_worktree_refuses_nonexistent(sandbox, tmp_path, monkeypatch):
+    """🔴 keep 一个不存在的 worktree 必须报错,不能回一句「已保留」。
+
+    2026-08-15 扫描发现:keep_worktree 从不检查存在性 ——
+    create 检查了、remove 检查了,只有它没有。
+    🪝 工具返回【假成功】比返回错误更糟:模型会拿它当事实继续往下走,
+       而且这种错在日志里看起来一切正常。
+    """
+    monkeypatch.setattr(sandbox, "WORKTREES_DIR", tmp_path / "wt")
+    (tmp_path / "wt").mkdir()
+    out = sandbox.keep_worktree("no_such_tree")
+    assert "not found" in out.lower(), f"居然说保留成功了: {out!r}"
+
+
+def test_worktree_errors_share_one_format(sandbox):
+    """三个 worktree 函数对同一种非法输入,要给一样格式的错误。
+
+    原来 create 带 "Error: " 前缀、remove/keep 不带。
+    🪝 错误消息是给【模型】看的 —— 格式一致它才容易识别「这是一次失败」。
+    """
+    bad = "../etc"  # 路径穿越,三个都该拒
+    outs = [
+        sandbox.create_worktree(bad),
+        sandbox.remove_worktree(bad),
+        sandbox.keep_worktree(bad),
+    ]
+    for o in outs:
+        assert o.startswith("Error: "), f"格式不一致: {o!r}"
