@@ -57,9 +57,30 @@ spec.loader.exec_module(m)
 # ─────────────────────────────────────────────────────────────────────────
 _orig_create = m.client.chat.completions.create
 _trace = {"turns": [], "system_prompt_chars": 0}
+# 附加层的账:主循环之外那几次【非流式】LLM 调用。
+# 2026-08-15 grep 出 7 个 create 调用点,主干的 TOKEN_USAGE 只覆盖主循环那一个,
+# 漏掉的四处恰恰【就是消融的两个轴】:
+#     select_relevant_memories / extract_memories / consolidate_memories  → memory 层
+#     summarize_history                                                    → compact 层
+# 不记的话,self 臂比 none 臂多花的钱一分都看不见 —— memory 轴的成本差异是假的。
+# calls 这个数本身就有价值:它直接量化「这一层额外调了几次 LLM」。
+_aux = {"prompt": 0, "completion": 0, "total": 0, "calls": 0}
 
 
 def _spy_create(**kwargs):
+    # 🔴 流式=主循环的一轮,非流式=附加层的一次调用,两者【绝不能混进同一个 turns】。
+    #    混了的话 turns 虚高,而 reminders/todo_calls 取 turns[-1] 会取到
+    #    extract_memories 那次(它传的是 pre_compress 完整历史,数出来的 reminder 是别人的)。
+    if not kwargs.get("stream"):
+        resp = _orig_create(**kwargs)
+        u = getattr(resp, "usage", None)  # 探针实测:ChatCompletion 有,Stream 没有
+        if u:
+            _aux["prompt"] += u.prompt_tokens
+            _aux["completion"] += u.completion_tokens
+            _aux["total"] += u.total_tokens
+        _aux["calls"] += 1
+        return resp
+
     msgs = kwargs.get("messages", [])
     sys_msgs = [x for x in msgs if x.get("role") == "system"]
     if sys_msgs:
@@ -102,6 +123,16 @@ try:
     with m.agent_lock:
         m.run_agent_turn_locked(task_text)
 finally:
+    # 真实 token 账单(2026-08-15 起):主干在 agent_loop 里按轮累加。
+    # 🪝 这是消融的【分母】—— 之前只能拿 steps 当成本的近似,现在是真数字:
+    #    「todo_write 那 947 字符 schema 值不值」届时是一道除法,不是感觉。
+    # 分两本账记,不合并:
+    #   loop = 主循环(流式),由主干 TOKEN_USAGE 在 agent_loop 里逐轮累加
+    #   aux  = 附加层(非流式),由上面的 spy 从 response.usage 直接读
+    # 🪝 分开记比合并更有价值 —— 「这一层自己烧了多少」正是消融要回答的问题,
+    #    合成一个总数就再也拆不开了。
+    _trace["tokens_loop"] = dict(getattr(m, "TOKEN_USAGE", {}))
+    _trace["tokens_aux"] = dict(_aux)
     # finally:超时被 kill 之外的任何退出路径都要留下轨迹 ——
     # 崩溃那次的轨迹恰恰最该看(㉚:success 会骗人,只有轨迹说实话)
     TRACE_PATH.write_text(json.dumps(_trace, ensure_ascii=False), encoding="utf-8")

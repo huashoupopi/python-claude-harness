@@ -328,6 +328,17 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
         "todo_calls": turns[-1]["todo_calls"] if turns else 0,
         "memory_injected": any(t.get("memory_injected") for t in turns),
         "ctx_chars_max": max((t["chars"] for t in turns), default=0),
+        # ── 真实成本:消融的分母。之前只能拿 steps 当近似 ──
+        # 两本账分开:loop=主循环(流式),aux=附加层(记忆挑/提取/合并、compact 摘要,全是非流式)。
+        # 🪝 合成一个总数就再也拆不开了,而「这一层自己烧了多少」正是消融要回答的问题。
+        "tokens_loop": trace.get("tokens_loop", {}).get("total", 0),
+        "tokens_loop_prompt": trace.get("tokens_loop", {}).get("prompt", 0),
+        "tokens_aux": trace.get("tokens_aux", {}).get("total", 0),
+        "aux_calls": trace.get("tokens_aux", {}).get("calls", 0),
+        "tokens_total": (
+            trace.get("tokens_loop", {}).get("total", 0)
+            + trace.get("tokens_aux", {}).get("total", 0)
+        ),
     }
 
     with _io_lock:
@@ -386,7 +397,9 @@ for name in CONFIGS:
         f"改动 {avg('lines_added') + avg('lines_removed'):.0f} 行/"
         f"{avg('files_touched'):.1f} 文件   "
         f"催 {avg('reminders'):.1f} 次 → todo {avg('todo_calls'):.1f} 次   "
-        f"上下文峰值 {avg('ctx_chars_max') / 1000:.1f}k 字符"
+        f"token {avg('tokens_total') / 1000:.1f}k"
+        f"(主 {avg('tokens_loop') / 1000:.1f}k + 附加层 {avg('tokens_aux') / 1000:.1f}k"
+        f"/{avg('aux_calls'):.1f} 次调用)"
     )
 
 bad = [r for r in results if r["tests_tampered"]]

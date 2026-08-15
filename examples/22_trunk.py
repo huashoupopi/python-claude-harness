@@ -136,6 +136,7 @@ if TODO_MODE not in TODO_MODES:
 #    它丢的是整个 msg。去掉①之后这层保护也没了,所以②里必须显式
 #    build_message(text, {}) 把可能残缺的 tool_calls 丢掉,否则孤儿 → API 400。
 DEFAULT_MAX_TOKENS = 8000
+TOKEN_USAGE = {"prompt": 0, "completion": 0, "total": 0}
 MAX_RECOVERY_RETRIES = 3
 MAX_RETRIES = 10
 BASE_DELAY_MS = 500
@@ -2327,7 +2328,12 @@ def spawn_subagent(description: str) -> str:
             stream=True,
             max_tokens=DEFAULT_MAX_TOKENS,
         )
-        text, tool_calls, _finish = accumulate_stream(stream)
+        # 📌 TODO(2026-08-15):子 agent 的 token 没进 TOKEN_USAGE。
+        #    该算 —— 消融比的是「一次任务的总成本」,子 agent 烧的也是同一笔钱。
+        #    但这次先不算:上面那个 create 还没加 stream_options,_usage 拿到的是 None,
+        #    写了也是空转;而 mini-bench 八道题没有一道会触发 spawn_subagent,
+        #    现在补它等于为一条跑不到的路径花时间。等主循环的数据出来再说。
+        text, tool_calls, _finish, _usage = accumulate_stream(stream)
         messages.append(build_message(text, tool_calls))
         calls = [tc for _, tc in sorted(tool_calls.items())]
         if not calls:
@@ -3135,7 +3141,12 @@ def accumulate_stream(chunks):
     final_tool_calls = {}
     final_text = ""
     finish_reason = None
+    usage = None
     for chunk in chunks:
+        if chunk.usage:
+            usage = chunk.usage
+        if not chunk.choices:
+            continue
         delta = chunk.choices[0].delta
         if delta.content:
             final_text += delta.content
@@ -3151,7 +3162,7 @@ def accumulate_stream(chunks):
         if chunk.choices[0].finish_reason:
             finish_reason = chunk.choices[0].finish_reason
 
-    return final_text, final_tool_calls, finish_reason
+    return final_text, final_tool_calls, finish_reason, usage
 
 
 def build_message(text, tool_calls):
@@ -3247,10 +3258,15 @@ def agent_loop(messages: list, context: dict):
                     tool_choice="auto",
                     stream=True,
                     max_tokens=DEFAULT_MAX_TOKENS,
+                    stream_options={"include_usage": True},
                 )
                 return accumulate_stream(stream)
 
-            text, tool_calls, finish_reason = with_retry(do_request, state)
+            text, tool_calls, finish_reason, usage = with_retry(do_request, state)
+            if usage:
+                TOKEN_USAGE["prompt"] += usage.prompt_tokens
+                TOKEN_USAGE["completion"] += usage.completion_tokens
+                TOKEN_USAGE["total"] += usage.total_tokens
             reactive_retries = 0
         except Exception as e:
             if (

@@ -1,4 +1,12 @@
-"""流式累积逻辑的单元测试。被测:probe_stream.accumulate_stream
+"""流式累积逻辑的单元测试。被测:**22_trunk.accumulate_stream**(经 conftest 的 trunk fixture)
+
+🔴 2026-08-15 换靶子:本文件原来 `from probe_stream import accumulate_stream`——
+那是 T20 探针脚本里的【另一份副本】。今天给主干加 usage(返回值 3 元组→4 元组)时,
+这 7 条测试【一声都没吭】,79 条全绿 —— 因为它们守的根本不是主干。
+两份已经分叉:probe_stream 那份停在 8/12,没有 usage、没有空 choices 保护。
+🪝 测试文件里的 import 写错对象,测试就变成纯装饰品 —— 而且它永远是绿的,永远不提醒你。
+🪝 同一个病的第二次:T18.5 冒烟闸立项的原因正是「12 条绿灯测的是 harness/ 死包」。
+   这笔账 T20 结站时自己记过(「两处各存一份,T19 收进包时统一」),没还,今天暴雷。
 
 为什么必须造假数据:真端点(deepseek-v4-flash)的 arguments 是【一片给完】的,
 按 index 累积那条路径在真实调用里【永远跑不到】——改对了也证明不了。
@@ -15,8 +23,6 @@ import json
 
 from openai.types.chat import ChatCompletionChunk
 from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall
-
-from probe_stream import accumulate_stream, build_message
 
 
 def make_chunk(content=None, tool_calls=None, finish_reason=None):
@@ -48,14 +54,14 @@ def make_chunk(content=None, tool_calls=None, finish_reason=None):
     )
 
 
-def test_text_only_no_tool_calls():
+def test_text_only_no_tool_calls(trunk):
     """形状D:纯说话不调工具。文本拼全、工具篮子为空、finish_reason 是 stop。"""
     chunks = [
         make_chunk(content="你好"),
         make_chunk(content="!"),
         make_chunk(finish_reason="stop"),
     ]
-    text, tool_calls, reason = accumulate_stream(chunks)
+    text, tool_calls, reason, _usage = trunk.accumulate_stream(chunks)
     assert text == "你好!"
     assert tool_calls == {}
     assert reason == "stop"
@@ -74,7 +80,7 @@ def test_text_only_no_tool_calls():
 #        片3 finish_reason='tool_calls'
 #   断言:篮子里 1 个;arguments 能被 json.loads 吃下且 location 对;
 #        name/id 对;reason == 'tool_calls'
-def test_single_chunk_tool_call():
+def test_single_chunk_tool_call(trunk):
     chunks = [
         make_chunk(content="\n\n"),
         make_chunk(
@@ -92,7 +98,7 @@ def test_single_chunk_tool_call():
         ),
         make_chunk(finish_reason="tool_calls"),
     ]
-    text, tool_calls, reason = accumulate_stream(chunks)
+    text, tool_calls, reason, _usage = trunk.accumulate_stream(chunks)
     assert text == "\n\n"
     assert len(tool_calls) == 1
     call = tool_calls[0]
@@ -111,7 +117,7 @@ def test_single_chunk_tool_call():
 #   断言:拼出来 == '{"location":"Paris, France"}';json.loads 后 location 对;
 #        name/id 没丢(它们只在第一片出现过)
 #   ⚠️ 这条红了就说明 .function.arguments 那行或 if/else 有问题
-def test_chunked_arguments_are_accumulated():
+def test_chunked_arguments_are_accumulated(trunk):
     chunks = [
         make_chunk(
             tool_calls=[
@@ -195,7 +201,7 @@ def test_chunked_arguments_are_accumulated():
         ),
         make_chunk(finish_reason="tool_calls"),
     ]
-    text, tool_calls, reason = accumulate_stream(chunks)
+    text, tool_calls, reason, _usage = trunk.accumulate_stream(chunks)
     assert text == ""
     assert len(tool_calls) == 1
     call = tool_calls[0]
@@ -209,7 +215,7 @@ def test_chunked_arguments_are_accumulated():
 #   数据:最后一片【同时】带 tool_calls 和 finish_reason='tool_calls'
 #   断言:工具调用没丢
 #   说明:你现在没写 break,所以应该直接绿——这条是防止未来改坏的护栏
-def test_tool_call_in_the_same_chunk_as_finish_reason():
+def test_tool_call_in_the_same_chunk_as_finish_reason(trunk):
     chunks = [
         make_chunk(
             tool_calls=[
@@ -226,7 +232,7 @@ def test_tool_call_in_the_same_chunk_as_finish_reason():
             finish_reason="tool_calls",
         )
     ]
-    text, tool_calls, reason = accumulate_stream(chunks)
+    text, tool_calls, reason, _usage = trunk.accumulate_stream(chunks)
     assert len(tool_calls) == 1
     call = tool_calls[0]
     args = json.loads(call.function.arguments)
@@ -251,7 +257,7 @@ def test_tool_call_in_the_same_chunk_as_finish_reason():
 """
 
 
-def test_has_tool_call():
+def test_has_tool_call(trunk):
     text = "Hello"
     tool_calls = {
         0: ChoiceDeltaToolCall.model_validate(
@@ -266,7 +272,7 @@ def test_has_tool_call():
             }
         )
     }
-    msg = build_message(text, tool_calls)
+    msg = trunk.build_message(text, tool_calls)
     expected_msg = {
         "role": "assistant",
         "content": text,
@@ -284,14 +290,14 @@ def test_has_tool_call():
     assert msg == expected_msg
 
 
-def test_no_tool_call():
+def test_no_tool_call(trunk):
     text = "Hello"
     tool_calls = {}
-    msg = build_message(text, tool_calls)
+    msg = trunk.build_message(text, tool_calls)
     assert "tool_calls" not in msg
 
 
-def test_parallel_tool_calls_out_of_order():
+def test_parallel_tool_calls_out_of_order(trunk):
     text = "Hello"
     tool_calls = {
         1: ChoiceDeltaToolCall.model_validate(
@@ -317,7 +323,7 @@ def test_parallel_tool_calls_out_of_order():
             }
         ),
     }
-    msg = build_message(text, tool_calls)
+    msg = trunk.build_message(text, tool_calls)
     expected_msg = {
         "role": "assistant",
         "content": text,
@@ -341,3 +347,63 @@ def test_parallel_tool_calls_out_of_order():
         ],
     }
     assert msg == expected_msg
+
+
+def make_usage_chunk(prompt=10, completion=2):
+    """造一片【只有 usage、没有 choices】的 chunk。
+
+    这是 stream_options={"include_usage": True} 时真实会来的最后一片。
+    make_chunk 造不出它 —— 那个函数固定塞一个 choice 进去。
+    """
+    return ChatCompletionChunk.model_validate(
+        {
+            "id": "chatcmpl-fake",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "fake-model",
+            "choices": [],  # ← 空!
+            "usage": {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": prompt + completion,
+            },
+        }
+    )
+
+
+def test_usage_chunk_has_empty_choices(trunk):
+    """🔴 形状E:usage 那一片 choices 是空列表 —— chunk.choices[0] 会 IndexError。
+
+    2026-08-15 真端点实测(scratchpad/probe_usage.py):
+        片 0  choices=1  content='hi'   usage=None
+        片 1  choices=1  finish=stop    usage=None
+        片 2  choices=0  ← 空!          usage=CompletionUsage(prompt=10, completion=2)
+
+    两条都要钉住:
+      ① 空 choices 不许炸(必须先判断再取 [0])
+      ② usage 片在 finish_reason 【之后】才来 —— 它不能把已收到的 finish_reason 冲掉,
+         而且「看到 finish 就 break」的写法会永远丢掉 usage。
+    🪝 又一次「不能假设分片的形状」—— T20 学的是分片【边界】不确定,
+       这次是分片【结构】本身都会变。
+    """
+    chunks = [
+        make_chunk(content="hi"),
+        make_chunk(finish_reason="stop"),
+        make_usage_chunk(prompt=10, completion=2),
+    ]
+    text, tool_calls, reason, usage = trunk.accumulate_stream(chunks)
+    assert text == "hi"
+    assert tool_calls == {}
+    assert reason == "stop", "usage 片不该把 finish_reason 冲掉"
+    assert usage is not None, "usage 没收到 —— 检查 continue 是不是放在收 usage 之前了"
+    assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == (10, 2, 12)
+
+
+def test_no_usage_when_not_requested(trunk):
+    """不带 include_usage 时(＝流里没有 usage 片),usage 应为 None 而不是报错。
+
+    对照组。A 组探针实测:不要就永远不给,全程 usage=None。
+    """
+    chunks = [make_chunk(content="hi"), make_chunk(finish_reason="stop")]
+    _text, _tc, _reason, usage = trunk.accumulate_stream(chunks)
+    assert usage is None
