@@ -2497,11 +2497,20 @@ def run_get_task(task_id: str) -> str:
 
 
 def run_claim_task(task_id: str) -> str:
-    return claim_task(task_id, owner="agent")
+    # 🔴 2026-08-15 补:原来没有 try —— 同族三个工具只有 run_get_task 处理了。
+    #    模型 claim 一个不存在的任务(它很容易这么干)→ load_task 抛 FileNotFoundError
+    #    → execute_tool 不兜底 → 一路穿透到 main,整个程序崩掉。
+    try:
+        return claim_task(task_id, owner="agent")
+    except FileNotFoundError:
+        return f"Error: Task {task_id} not found"
 
 
 def run_complete_task(task_id: str) -> str:
-    return complete_task(task_id)
+    try:
+        return complete_task(task_id)
+    except FileNotFoundError:
+        return f"Error: Task {task_id} not found"
 
 
 def run_schedule_cron(
@@ -3157,7 +3166,20 @@ def execute_tool(tc, TR) -> str:
             args = json.loads(args)
         handler = entry.handler
         print(f"[tool call] {tc.function.name} with args: {args}")
-        return handler(**args)
+        # 🔴 2026-08-15 加的兜底。原来是裸的 return handler(**args):
+        #    只要有一个 handler 忘了处理异常,后果就分两条路 ——
+        #      前台:agent_loop 里那句 execute_tool 不在 try 里 → 穿透到 main,程序崩掉
+        #      后台:worker 线程直接死掉,status 永远停在 "running",
+        #            模型永远等不到结果,而且一点报错都看不到(daemon 线程死得无声无息)
+        #    实测就抓到一个:run_claim_task 没 try,而同族的 run_get_task 有。
+        # 🪝 「27 个工具每个都记得自己 try」是【列举】,总有一个会漏;
+        #    「execute_tool 统一兜住」是【构造】—— 漏不漏都不影响结果。
+        # ⚠️ 兜底不等于吞掉:错误消息要带上工具名和异常类型,
+        #    因为它会原样进模型的上下文 —— 错误消息就是 prompt。
+        try:
+            return handler(**args)
+        except Exception as e:
+            return f"Error: tool '{tc.function.name}' failed - {type(e).__name__}: {e}"
 
 
 def start_background_task(tc, TR, args) -> str:

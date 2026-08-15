@@ -129,3 +129,50 @@ def test_illegal_switch_values_fail_loud(monkeypatch):
         else:
             raise AssertionError(f"{var}='bogus' 本该当场炸")
         monkeypatch.delenv(var)
+
+
+# ---------- 工具执行的兜底(T21 扫描) ----------
+
+
+def test_execute_tool_never_raises(sandbox):
+    """🔴 任何 handler 抛异常,execute_tool 都必须转成【错误字符串】而不是往外抛。
+
+    2026-08-15 扫描实测:9 个工具里 8 个自己处理了异常,run_claim_task 没有 ——
+    模型 claim 一个不存在的任务(它很容易这么干)就会 FileNotFoundError。
+    而 execute_tool 当时是裸的 `return handler(**args)`,后果分两条路:
+        前台  agent_loop 那句 execute_tool 不在 try 里 → 穿透到 main,程序崩掉
+        后台  worker 线程直接死,status 永远 "running",模型永远等不到结果,
+              而且【一点报错都看不到】—— daemon 线程死得无声无息
+    🪝「27 个工具每个都记得自己 try」是列举,总有一个会漏;
+       「execute_tool 统一兜住」是构造 —— 漏不漏都不影响结果。
+    """
+
+    class BoomFn:
+        name = "boom"
+        arguments = "{}"
+
+    class BoomTC:
+        id = "call_boom"
+        function = BoomFn()
+
+    def boom():
+        raise RuntimeError("我炸了")
+
+    registry = dict(sandbox.assemble_tool_pool())
+    registry["boom"] = sandbox.ToolEntry("会炸的工具", {}, None, boom)
+
+    out = sandbox.execute_tool(BoomTC(), registry)  # 不抛异常即通过
+    assert isinstance(out, str)
+    # 兜底不等于吞掉:消息要带工具名和异常类型,因为它会原样进模型的上下文
+    assert "boom" in out and "RuntimeError" in out and "我炸了" in out
+
+
+def test_task_tools_report_missing_task_uniformly(sandbox):
+    """同族三个任务工具,对「任务不存在」要给一样的交代。
+
+    原来只有 run_get_task 处理了,claim/complete 两个裸奔。
+    🪝 同族函数写法不一致,就是漏的温床 —— 一眼扫过去看不出哪个没处理。
+    """
+    for fn in (sandbox.run_get_task, sandbox.run_claim_task, sandbox.run_complete_task):
+        out = fn("no_such_task")
+        assert "not found" in out.lower(), f"{fn.__name__} 没给出「找不到」的交代: {out!r}"
