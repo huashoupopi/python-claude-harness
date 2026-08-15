@@ -46,6 +46,16 @@ TRIALS = int(os.getenv("BENCH_TRIALS", "3"))
 DRY_RUN = os.getenv("BENCH_DRY_RUN") == "1"
 DELETIONS = "_deletions.txt"  # solution/ 里的特殊文件,见 verify_tasks.py
 
+# 🔴🔴 TODO(下次开跑前必做):把 solution/ 在跑之前临时改名藏起来,try/finally 恢复。
+# 2026-08-15 实测泄漏 2/120:模型做不出题(48 次 write_file 仍不过),掉头去查评测系统,
+# 找到 bench/tasks/<题>/solution/ 直接 cat 了标准答案,日志里自己写着「已对齐 solution」。
+# ⚠️ 建 solution/ 时明确想过「它不会进考场」—— 但那只防住了 copytree,没防住 bash。
+# ⚠️ tests_tampered 那道闸完全没反应:它防的是【改测试】,模型走的是【抄答案】。
+# 🪝 防作弊闸只挡住了你想到的那条路。黑名单挡不住越界,只有隔离能挡(→ T21 沙箱的
+#    第二个实证动机;第一个是 T19 自测发现 bash 绕过 write_file 的路径检查)。
+# 检测(扫日志里的路径字符串)保留作兜底,但它是下界不是准确值 —— 模型若用变量拼
+# 路径就检测不到。
+
 # 配置名 -> 这个臂要注入的环境变量
 #
 # 【2026-08-14 stage-2 改造】
