@@ -37,8 +37,8 @@ from pydantic import BaseModel, Field
 load_dotenv(override=True)
 
 client = OpenAI(
-    base_url=os.getenv("NVIDIA_BASE_URL"),
-    api_key=os.getenv("NVIDIA_API_KEY"),
+    base_url=os.getenv("BASE_URL"),
+    api_key=os.getenv("API_KEY"),
     timeout=120.0,
     default_headers={"User-Agent": "curl/8.7.1"},
 )
@@ -53,7 +53,7 @@ WORKTREES_DIR = WORKDIR / ".worktrees"
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 SKILLS_DIR = WORKDIR / "skills"
-model = os.getenv("NVIDIA_MODEL")
+model = os.getenv("MODEL")
 
 CURRENT_TODOS: list = []
 MAX_GLOB_RESULTS = 200
@@ -146,7 +146,7 @@ MAX_CONSECUTIVE_529 = 3
 # 目的只是先把 529 → 切换 这条路径跑通。真要有容灾,改读独立的 FALLBACK_MODEL 变量即可
 # (with_retry 里已有「没配就只打日志继续重试」的分支,值为 None 是安全的)。
 # → 切换是否真的生效,靠单元测试 monkeypatch 一个假模型名来验,不靠线上行为。
-FALLBACK_MODEL = os.getenv("NVIDIA_MODEL")
+FALLBACK_MODEL = os.getenv("MODEL")
 CONTINUATION_PROMPT = "Output token limit hit. Resume directly — no apology, no recap. Pick up mid-thought."
 
 # 子代理(s06/s07):一次性、只回结论。"Do not delegate further" 是防套娃的第一道,
