@@ -111,6 +111,68 @@ CONFIGS = {
 IGNORE_CACHES = shutil.ignore_patterns("__pycache__", ".pytest_cache", "*.pyc")
 
 
+TRACE_NAME = ".bench_trace.json"  # agent_runner 写在 cwd(=考场)下的那份
+
+
+def task_rounds(task_dir: Path) -> list[Path]:
+    """这道题分几轮:task.md 是第一轮,round2.md / round3.md 依次往后。
+
+    📌 没有 round2.md 的题就只有一轮 —— 也就是【加多轮之前代码本来的样子】。
+       老 12 题一个字不用改,行为完全不变。
+    """
+    rounds = [task_dir / "task.md"]
+    n = 2
+    while (task_dir / f"round{n}.md").exists():
+        rounds.append(task_dir / f"round{n}.md")
+        n += 1
+    return rounds
+
+
+def read_trace(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"parse_error": True}
+
+
+def merge_traces(traces: list[dict]) -> dict:
+    """把多轮的轨迹并成一份。
+
+    轮次之间是【独立进程】,每一轮的计数器都从 0 重新开始,所以合并规则按量的性质分:
+        累积量(reminders / todo_calls / token)  取每轮末值再【相加】
+        规模量(ctx_chars_max / sys_prompt_chars) 取【最大】—— 相加没有意义
+        turns                                    首尾相接
+    🪝 合成一个数就再也拆不开了 —— 和 tokens_loop/tokens_aux 分两本账是同一条道理。
+    """
+    traces = [t for t in traces if t]
+    if not traces:
+        return {}
+    if len(traces) == 1:
+        return traces[0]
+
+    merged = {"turns": [], "rounds": len(traces)}
+    for key in ("tokens_loop", "tokens_aux"):
+        merged[key] = {}
+        for field in ("total", "prompt", "calls"):
+            merged[key][field] = sum(t.get(key, {}).get(field, 0) for t in traces)
+    merged["system_prompt_chars"] = max(
+        (t.get("system_prompt_chars", 0) for t in traces), default=0
+    )
+    # reminders / todo_calls 记在每一轮【最后一个 turn】上,是那一轮的累计值。
+    # 直接把各轮的 turns 接起来会让计数看着"倒退",所以这里把末值加总后重新钉在最后一格。
+    reminders = sum((t["turns"][-1]["reminders"]) for t in traces if t.get("turns"))
+    todo_calls = sum((t["turns"][-1]["todo_calls"]) for t in traces if t.get("turns"))
+    for t in traces:
+        merged["turns"].extend(t.get("turns", []))
+    if merged["turns"]:
+        merged["turns"][-1] = dict(merged["turns"][-1])
+        merged["turns"][-1]["reminders"] = reminders
+        merged["turns"][-1]["todo_calls"] = todo_calls
+    return merged
+
+
 _io_lock = threading.Lock()  # 保护 results.jsonl 与 print —— 并发下两者都会交错
 
 
@@ -286,6 +348,9 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
     # 收尸只能靠起它的人。名字带上臂/题/轮次,并行 4 路也不会撞。
     sbx_tag = f"{name}-{task_dir.name}-t{trial}".replace("_", "-")
 
+    rounds = task_rounds(task_dir)
+    out = err = ""
+
     if DRY_RUN:
         # 冒烟模式:跳过 agent,直接上标准答案。验的是 bench 自己,不是模型。
         apply_solution(task_dir / "solution", repo)
@@ -301,24 +366,35 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
             env["SANDBOX_MODE"] = "docker"
             env["SANDBOX_NETWORK"] = "none"  # 无人看守的批量跑:断网防外泄
             env["SANDBOX_TAG"] = sbx_tag
-        try:
-            proc = subprocess.run(
-                [sys.executable, str(RUNNER), str(task_dir.resolve() / "task.md")],
-                cwd=repo,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=TIMEOUT_S,
-            )
-            duration = time.time() - start_time
-            out, err = proc.stdout, proc.stderr
-        except subprocess.TimeoutExpired as e:
-            # 超时的轨迹恰恰是最该看的那一份 —— 它记着模型卡在哪里循环。
-            # (2026-08-14 教训:success 会骗人、steps 会骗人,只有轨迹说实话。
-            #  空转 15 步那次如果日志被丢了,这个 bug 至今还在。)
-            timed_out = True
-            duration = time.time() - start_time
-            out, err = _as_text(e.stdout), _as_text(e.stderr)
+        # 多轮题:每一轮 = 一个【独立进程】,messages 从零开始,
+        # 靠留在考场里的 .memory 把上一轮的东西带过来 —— 这正是记忆轴要测的东西。
+        # ⚠️ 每轮跑完立刻把轨迹改名存下来,否则下一轮会把它【覆盖掉】。
+        for index, prompt_file in enumerate(rounds, start=1):
+            try:
+                proc = subprocess.run(
+                    [sys.executable, str(RUNNER), str(prompt_file.resolve())],
+                    cwd=repo,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=TIMEOUT_S,  # 每轮各自计时,不是全程共用一份
+                )
+                out += proc.stdout
+                err += proc.stderr
+            except subprocess.TimeoutExpired as e:
+                # 超时的轨迹恰恰是最该看的那一份 —— 它记着模型卡在哪里循环。
+                # (2026-08-14 教训:success 会骗人、steps 会骗人,只有轨迹说实话。
+                #  空转 15 步那次如果日志被丢了,这个 bug 至今还在。)
+                timed_out = True
+                out += _as_text(e.stdout)
+                err += _as_text(e.stderr)
+            finally:
+                live = repo / TRACE_NAME
+                if live.exists():
+                    live.rename(repo / f".bench_trace_r{index}.json")
+            if timed_out:
+                break  # 这一轮就没跑完,下一轮的起点已经不可信了
+        duration = time.time() - start_time
 
     if SANDBOX:
         # 兜底收尸:正常退出时 agent_runner 已经拆过,这里是幂等的二次确认;
@@ -346,13 +422,13 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
 
     # agent_runner 在【发请求那一刻】记下的轨迹(reminder 注入次数、上下文规模…);
     # 超时被 kill 的那次可能没写成,所以要容错 —— 不能因为拿不到轨迹就丢掉整条记录。
-    trace = {}
-    trace_path = repo / ".bench_trace.json"
-    if trace_path.exists():
-        try:
-            trace = json.loads(trace_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            trace = {"parse_error": True}
+    # 多轮题:每轮的轨迹已经在跑完时改名存开了,这里按轮次读回来再合并。
+    # 单轮题只会命中 .bench_trace_r1.json 一份,合并是恒等操作。
+    # (TRACE_NAME 那份是没被改名的残留 —— 兜底也读一下,免得静默丢掉整条记录。)
+    trace = merge_traces(
+        [read_trace(repo / f".bench_trace_r{i}.json") for i in range(1, len(rounds) + 1)]
+        or [read_trace(repo / TRACE_NAME)]
+    ) or read_trace(repo / TRACE_NAME)
     turns = trace.get("turns", [])
 
     record = {
@@ -366,6 +442,7 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
         "pass_rate": round(counts["passed"] / total, 3) if total else 0.0,
         "collect_error": counts["error"] > 0,  # 收集就挂了 ≠ 断言失败
         "steps": steps,
+        "rounds": len(rounds),  # 多轮题的 steps/token 是全程累计,不跟单轮题直接比
         "duration_s": duration,
         "timed_out": timed_out,
         "tests_tampered": tampered,  # 非空 = 考生动过卷子(已按原卷判,但行为要留痕)

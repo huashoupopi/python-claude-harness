@@ -1,0 +1,6 @@
+# field | rule | argument
+# Edit this file, then regenerate validators.py.
+username | min_length | 3
+email | contains | @
+age | max_value | 130
+zipcode | exact_length | 6
