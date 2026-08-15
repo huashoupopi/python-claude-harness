@@ -44,6 +44,11 @@ TIMEOUT_S = int(os.getenv("BENCH_TIMEOUT", "900"))  # 3 倍中位数,留足尾�
 WORKERS = int(os.getenv("BENCH_WORKERS", "4"))
 TRIALS = int(os.getenv("BENCH_TRIALS", "3"))
 DRY_RUN = os.getenv("BENCH_DRY_RUN") == "1"
+# 沙箱:默认【开】—— 与主干相反,这是有意的。
+# 主干默认 off 是因为「加功能不能改变原有行为」;而 bench 是【无人看守的批量跑】,
+# 2026-08-15 正是在这里被泄漏了 2/120(模型跑出考场 cat 了 solution/)。
+# 🪝 同一个开关的默认值,在不同场合可以不同 —— 取决于「出事时有没有人在看」。
+SANDBOX = os.getenv("BENCH_SANDBOX", "1") == "1"
 DELETIONS = "_deletions.txt"  # solution/ 里的特殊文件,见 verify_tasks.py
 
 # 🔴🔴 TODO(下次开跑前必做):把 solution/ 在跑之前临时改名藏起来,try/finally 恢复。
@@ -264,6 +269,11 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
 
     timed_out = False
     start_time = time.time()
+    # ⚠️ 定义在分支【外面】:dry-run 走的是另一条路,但下面的清理是两条路共用的。
+    #    (第一版把它写在 else 里,dry-run 当场 UnboundLocalError —— 冒烟闸抓到的。)
+    # 容器名由【这一方】决定 —— 子进程超时会被 kill,它的 finally 跑不到,
+    # 收尸只能靠起它的人。名字带上臂/题/轮次,并行 4 路也不会撞。
+    sbx_tag = f"{name}-{task_dir.name}-t{trial}".replace("_", "-")
 
     if DRY_RUN:
         # 冒烟模式:跳过 agent,直接上标准答案。验的是 bench 自己,不是模型。
@@ -276,6 +286,10 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
         #    子进程连解释器和 .venv 都找不到。
         env = os.environ.copy()
         env.update(env_patch)
+        if SANDBOX:
+            env["SANDBOX_MODE"] = "docker"
+            env["SANDBOX_NETWORK"] = "none"  # 无人看守的批量跑:断网防外泄
+            env["SANDBOX_TAG"] = sbx_tag
         try:
             proc = subprocess.run(
                 [sys.executable, str(RUNNER), str(task_dir.resolve() / "task.md")],
@@ -294,6 +308,14 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
             timed_out = True
             duration = time.time() - start_time
             out, err = _as_text(e.stdout), _as_text(e.stderr)
+
+    if SANDBOX:
+        # 兜底收尸:正常退出时 agent_runner 已经拆过,这里是幂等的二次确认;
+        # 超时被 kill 那次,这里是【唯一】会执行的清理。
+        subprocess.run(
+            ["docker", "rm", "-f", f"harness-sbx-{sbx_tag}"],
+            capture_output=True, timeout=60,
+        )
 
     steps = out.count("[tool call]")
     (logs / "agent.log").write_text(

@@ -120,6 +120,38 @@ if MEMORY_MODE not in MEMORY_MODES:
     # 否则 bench 跑完一整轮才发现「消融臂根本没生效」,数据全废。
     raise ValueError(f"MEMORY_MODE={MEMORY_MODE!r} 不合法,只能是 {MEMORY_MODES} 之一")
 
+# ---------------------------------------------------------------------------
+# 沙箱开关(T21)。把 agent 的 bash 关进容器 —— 动机是两次【真实发生过】的越界:
+#   2026-08-12 T19 自测:write_file 越界被 permission_hook 拦下,模型改用
+#              `bash echo x > 越界路径` 写成功,还明说 "I'll use bash instead"
+#   2026-08-15 T22 跑批:模型做不出题,掉头 cat 了 bench 的 solution/(标准答案),
+#              自己写着「已对齐 solution」—— 而防作弊闸 tests_tampered 毫无反应,
+#              因为它防的是【改测试】,模型走的是【抄答案】
+# 🪝 一写一读,两次防护失效的形状相同:黑名单和白名单都是【列举】,而攻击面不可穷举;
+#    只有隔离是【构造性】的 —— 盒子外面的东西根本够不着,不需要你去想它会怎么绕。
+#
+# 📌 容器的生命周期 = 【一个隔离单元】的生命周期(一场考试 / 一次会话),
+#    不是一条命令,也不是「整个跑批共用一个」——
+#    后者会让 120 个考场互相看得见,等于把刚堵上的泄漏换个形式放回来。
+#    🪝 一个没有边界的隔离,不是隔离。
+#
+# 默认 off:不设开关时行为与加沙箱之前【一模一样】
+# (2026-08-14 那个 TODO_MODE 默认值 bug 的教训 —— fail loud 挡不住选错的默认)。
+SANDBOX_MODES = ("off", "docker")
+SANDBOX_MODE = os.getenv("SANDBOX_MODE", "off")
+if SANDBOX_MODE not in SANDBOX_MODES:
+    raise ValueError(f"SANDBOX_MODE={SANDBOX_MODE!r} 不合法,只能是 {SANDBOX_MODES} 之一")
+SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "harness-sandbox:1")
+# 网络【单独一个开关】,不跟沙箱捆在一起 —— 打开沙箱的本意是隔离文件系统,
+# 断网不该是它的副作用。
+# 默认 bridge(通网):你平时对话时人在旁边看着,而且断网会让 pip/curl 全废,
+# 那是个很大的行为改变,不该悄悄发生。
+# bench 跑批时【显式】设 none:那是无人看守的批量跑,最怕数据被发出去。
+# 🪝 又一次「默认值 = 最少惊讶的那个」—— 这个开关差点重蹈 TODO_MODE 的覆辙。
+SANDBOX_NETWORK = os.getenv("SANDBOX_NETWORK", "bridge")
+_sandbox_name: str | None = None
+
+
 TODO_MODES = ("none", "tool", "nudge")
 TODO_MODE = os.getenv("TODO_MODE", "nudge")
 if TODO_MODE not in TODO_MODES:
@@ -1973,6 +2005,53 @@ class KeepWorktreeArgs(BaseModel):
     name: str = Field(..., description="the name of the worktree to keep")
 
 
+def start_sandbox() -> str:
+    """起一个盒子,把【工作区那一个目录】挂进去,返回容器名。
+
+    三个关键选择:
+      ① -v WORKDIR:WORKDIR  挂到【相同路径】—— agent 手里全是宿主机绝对路径
+         (read_file 传的就是绝对路径),路径一致就不必做翻译,少一层出错的地方。
+      ② 只挂工作区这一层  →  今天泄漏的 bench/tasks/<题>/solution/ 在挂载点【之外】,
+         盒子里根本不存在这个目录。
+         🪝 不是「禁止访问 solution/」,而是「盒子里没有那个东西」——
+            这就是【构造】与【列举】的区别。
+      ③ --network none + 资源上限:断网防外泄(无人看守的批量跑最需要),
+         内存/CPU 上限防死循环烧穿(2026-08-15 那次连写 48 个文件、烧 24 万 token,
+         已经很接近失控)。
+    """
+    global _sandbox_name
+    if _sandbox_name:
+        return _sandbox_name
+    # 容器名可由外部指定(SANDBOX_TAG)。为什么要让外部能指定:
+    # 子进程若被 kill(bench 超时就是这样),它的 finally 不会执行、stop_sandbox 不会跑,
+    # 容器就泄漏了。让【起子进程的那一方】知道容器叫什么,它才能替死者收尸。
+    # 🪝 「谁能保证清理」和「谁创建」不是同一个问题 —— 会被强杀的那一方保证不了。
+    tag = os.getenv("SANDBOX_TAG") or f"{os.getpid()}-{int(time.time())}"
+    name = f"harness-sbx-{tag}"
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=60)  # 同名残留先清
+    subprocess.run(
+        [
+            "docker", "run", "-d", "--name", name,
+            "-v", f"{WORKDIR}:{WORKDIR}",
+            "-w", str(WORKDIR),
+            "--network", SANDBOX_NETWORK,
+            "--memory", "1g", "--cpus", "2",
+            SANDBOX_IMAGE,
+        ],
+        capture_output=True, text=True, check=True, timeout=60,
+    )
+    _sandbox_name = name
+    return name
+
+
+def stop_sandbox():
+    """销毁盒子。隔离单元结束就拆 —— 不拆的话下一场考试会看见上一场留下的东西。"""
+    global _sandbox_name
+    if _sandbox_name:
+        subprocess.run(["docker", "rm", "-f", _sandbox_name], capture_output=True, timeout=60)
+        _sandbox_name = None
+
+
 def run_bash(
     command: str, run_in_background: bool = False, cwd: Path | None = None
 ) -> str:
@@ -1980,14 +2059,24 @@ def run_bash(
     if any(d in command for d in dangerous):
         return "Error: dangerous command blocked"
     try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            cwd=cwd or WORKDIR,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
+        if SANDBOX_MODE == "docker":
+            # 盒子里执行。sh -c 让 shell 语法(管道/重定向/&&)照常可用 ——
+            # 隔离的是【能碰到什么】,不是【能写什么语法】。
+            result = subprocess.run(
+                ["docker", "exec", "-w", str(cwd or WORKDIR), start_sandbox(), "sh", "-c", command],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        else:
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=cwd or WORKDIR,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
         output = result.stdout + result.stderr
         if not output.strip():
             output = "(no output)"

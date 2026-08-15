@@ -123,6 +123,11 @@ try:
     with m.agent_lock:
         m.run_agent_turn_locked(task_text)
 finally:
+    # 沙箱容器:正常路径下自己收尸(超时被 kill 时轮不到这里跑,由 run_bench 兜底)
+    try:
+        m.stop_sandbox()
+    except Exception:
+        pass
     # 真实 token 账单(2026-08-15 起):主干在 agent_loop 里按轮累加。
     # 🪝 这是消融的【分母】—— 之前只能拿 steps 当成本的近似,现在是真数字:
     #    「todo_write 那 947 字符 schema 值不值」届时是一道除法,不是感觉。
