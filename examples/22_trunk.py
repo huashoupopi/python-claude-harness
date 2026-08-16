@@ -36,9 +36,17 @@ from pydantic import BaseModel, Field
 
 load_dotenv(override=True)
 
+# ⚠️ 这几行在【模块最外层】,谁 import 本文件谁就立刻执行到这里。
+# 而 OpenAI(api_key=None) 是【当场抛异常】,不是等真发请求才抛 ——
+# 于是没有 .env 的环境(CI)里 import 就炸,100 条测试塌 88 条,只剩 12 条不碰主干的。
+# 2026-08-16 实测:CI 最后一次绿灯停在 07-06,跑的正是那 12 条。
+# 🪝 同族第三次:代码依赖了「当前环境恰好有某个东西」(前两次是 ensure_dirs 缺 parents、
+#    load_dotenv 靠 cwd 恰好往上找得到 .env)。
+# 兜底而不改成延迟创建,是因为 test_compact.py 要 monkeypatch trunk.client.chat.completions,
+# 它需要 client 是个【模块级的完整对象】;测试从不真发请求,假 key 不影响任何一条。
 client = OpenAI(
-    base_url=os.getenv("BASE_URL"),
-    api_key=os.getenv("API_KEY"),
+    base_url=os.getenv("BASE_URL") or "http://localhost:1",
+    api_key=os.getenv("API_KEY") or "not-set",
     timeout=120.0,
     default_headers={"User-Agent": "curl/8.7.1"},
 )
