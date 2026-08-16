@@ -1,91 +1,134 @@
 # python-claude-harness
 
-**独立学习项目**：从零构建 Claude Code 风格的 Agent Harness（Python 实现）。
+一个能自己读代码、改代码、跑测试的编码 agent，以及一套用来**衡量它的**评测系统。
 
-## 项目定位
-- 完全独立的项目（不强制迁移/集成到 rework 等历史项目）。
-- 先跟随官方 [learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) 20章主线学习机制。
-- 同时在自己的仓库里**独立重新实现**，加深理解。
-- 强调 **Provider Adapter** 设计，从早期开始支持多后端（DeepSeek Anthropic 兼容、NVIDIA NIM OpenAI 兼容、未来 PydanticAI 等）。
-- 最终产出：可运行的独立 harness + 详细笔记 + 架构设计文档 + 迁移经验（对就业有直接帮助）。
+> ⚠️ 还在做，不是最终版本。
 
-## 推荐学习方式
-1. 先按官方课程走（s01 → s20），用参考仓库跑示例。
-2. 每章学完后，在本项目里**自己重新实现**对应部分（参考 `../stages/` 的补充说明）。
-3. 重点关注“为什么这么设计 + 如何做 Provider 抽象 + 生产级考虑”。
+---
 
-## 快速开始（参考官方课程）
+## 它能干什么
 
-### 1. 克隆参考仓库（只读，用于跑官方示例和对照源码）
+给它一句话，它自己拆任务、看文件、写代码、跑测试，不对就再改一轮：
+
 ```bash
-# 在 claude-code-harness-study 目录下执行
-cd /Users/liuchenxu/Documents/Documents/code/claude-code-harness-study
-git clone https://github.com/shareAI-lab/learn-claude-code
-cd learn-claude-code
-pip install -r requirements.txt
-cp .env.example .env
+uv run python examples/22_trunk.py "修好失败的测试"
 ```
 
-### 2. 配置 API（推荐先用 DeepSeek Anthropic 兼容端点）
-编辑 `learn-claude-code/.env`：
+不带参数就进对话模式。目前有 28 个工具（读写文件、跑命令、任务清单、子 agent、跨会话记忆、定时任务、git worktree、MCP 插件等）。
 
-```env
-ANTHROPIC_API_KEY=sk-你的DeepSeek-key
-ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
-MODEL=deepseek-chat
-```
+---
 
-- DeepSeek 的 Anthropic 兼容端点可以让官方示例代码**几乎不改**就能跑，tool calling 支持优秀，成本很低。
-- 获取 DeepSeek key：https://platform.deepseek.com
+## 这个项目真正在做的事
 
-### 3. 运行官方示例（跟随课程）
+写一个能跑的 agent 不难，难的是回答：**加的这些层，到底有没有用？**
+
+所以配了一套评测系统：15 道编程题，把 agent 的某一层开关掉，同一批题跑一遍，看差别。
+
+### 测出来的结果
+
+**5 种配置 × 15 道题 × 每种跑 3 次 = 225 次，全部做对。**
+
+| 关掉这一层 | 结果 | 意思 |
+|---|---|---|
+| **任务清单**（todo 工具） | 步数**掉一半**<br>14.6 → 7.1 步 | **最贵的一层。**而且题越难越贵：<br>简单题贵 5 步，难题贵 12 步 |
+| **记忆**（记住上一轮） | 几乎没差别<br>差 0.3 步 | **在这批题上白装了** |
+
+关掉 todo 那条，225 次里**没有一次反例**（42 组配对比较，42 组全部下降）。
+
+**两个补充**：
+
+- todo 层的成本来自**工具的存在**，不是系统去催它。只留工具、不催，步数几乎不变。
+- 15 道题全做对了，说明「做没做对」这个指标已经区分不出东西，**只能看它花了多少力气**。
+
+### 题目难度
+
+| | 平均步数 | 平均花费 |
+|---|---|---|
+| 基础题（8 道） | 9.3 步 | 25k tokens |
+| 进阶题（4 道） | 14.1 步 | 45k tokens |
+| 分两轮做的题（3 道） | 22.9 步 | 67k tokens |
+
+进阶题是真实后端里会遇到的坑：两个 bug 互相掩盖、多线程竞争、配置缓存不失效、网络重试导致重复扣款。
+
+---
+
+## 能看见 agent 干了什么
+
+每次跑完自动存一份记录，随时调出来看：
+
 ```bash
-python s01_agent_loop/code.py          # 起点：一个循环 + bash
-python s08_context_compact/code.py     # 上下文压缩（重要章）
-python s20_comprehensive/code.py       # 终点章：全部机制归到一个循环
+uv run python bench/trace_view.py
 ```
 
-### 4. 在本项目（python-claude-harness）里开始独立实现
-本目录就是你的**独立实现仓库**。
-
-推荐结构（我们会逐步填充）：
 ```
-python-claude-harness/
-├── harness/                 # 核心实现（你自己写）
-│   ├── core/
-│   │   ├── loop.py
-│   │   ├── provider_adapter.py   # 关键抽象，支持多 provider
-│   │   ├── context.py
-│   │   └── ...
-│   ├── tools/
-│   └── ...
-├── examples/
-├── notes/                   # 每章复盘笔记（强烈建议写）
-├── comparisons/             # 与官方实现、Aider、真实 CC 的对比
-└── pyproject.toml
+21 次工具调用   工具 1.4s (1%)   模型思考 131.2s (99%)
+图例: ▄ 读  █ 写  ▓ 执行  ░ 组织  · 思考   × 出错  ! 被拦
+
+  2 · bash        348ms  command=python -m pytest -v
+      ⋯ 模型思考 11.3s
+  4 · read_file     1ms  path=billing.py
 ```
 
-**第一阶段（Phase 0）要做的事**（对应官方 s01 + 我们的补充）：
-- 理解最小 agent loop（messages + tool_use/tool_result）。
-- 在自己的项目里**手写**一个最小可工作的 loop（不要直接复制官方代码）。
-- 开始考虑 ProviderAdapter 的接口设计（我们会在这个阶段引入）。
-- 写复盘笔记（见 `../stages/01_agent_loop.md`）。
+第一行那个数字挺意外：**工具执行只占 1%，99% 的时间模型在想**。也就是说想让 agent 快，方向不是把工具优化快，而是让它少想几轮。
 
-## API 策略（已确认）
-- **跟随官方课程阶段**：优先用 **DeepSeek Anthropic 兼容端点**（格式最匹配，tool_use 块一致，官方示例基本零修改）。
-- **NVIDIA NIM（你有免费额度）**：非常好的免费模型资源（很多 Free Endpoint）。它是 OpenAI 兼容格式。
-  - 我们会在 Provider Adapter 阶段专门支持 OpenAI 格式 provider。
-  - 届时你可以把 NVIDIA 的免费强模型（例如 nemotron 系列、cosmos 等）接进来测试。
-  - 你的当前 rate limit（huashoupopi, 40 rpm）很合适学习使用。
-- 后期可以轻松切换：DeepSeek → NVIDIA → 官方 Claude → 本地模型 等。
+---
 
-## 下一步建议
-1. 先按上面步骤 clone 参考仓库 + 配置 DeepSeek .env + 跑通官方 s01。
-2. 同时阅读 `../stages/01_agent_loop.md`（我们为独立项目调整后的版本，增加了 adapter 思考和独立项目说明）。
-3. 当你跑通官方 s01 后，告诉我，我们立刻开始在 `python-claude-harness` 里写第一个可工作的 loop + 基础 adapter 骨架。
+## 不让它乱来
 
-所有代码、笔记、对比都放在这个独立仓库里，最终会成为一个很好的学习 + 面试展示项目。
+agent 的 `bash` 是万能的，进程内的权限检查拦不住——真实发生过：文件工具的越界写被挡下之后，模型直接改用 `bash` 写成功了。
 
-有任何问题（clone 报错、.env 配置、NVIDIA 如何在 adapter 里用、第一阶段具体代码结构等），随时问我。我们一步一步来。
+所以把它整个关进 Docker 容器，只把工作目录挂进去。容器里工作目录外面的路径**根本不存在**。
 
-加油！这个项目做扎实了，对理解真实 agent harness 帮助非常大。
+```bash
+uv run python bench/sandbox_demo.py
+```
+
+```
+[关掉沙箱]  写工作区外 → 越界成功      读工作区外 → 内容泄漏
+[打开沙箱]  写工作区外 → 被挡住        读工作区外 → 被挡住
+两档都一样  正常做题   → 正常
+```
+
+最后一行不能省：**光证明"坏事被挡住"不够，还得证明"好事没被挡住"**——一个什么都干不了的沙箱也能通过前半边。
+
+---
+
+## 跑起来
+
+```bash
+uv sync                                        # 装依赖
+cp .env.example .env                           # 填 API key
+uv run python examples/22_trunk.py "你的任务"    # 跑 agent
+uv run pytest -q                               # 100 条测试
+```
+
+评测系统（要 Docker）：
+
+```bash
+uv run python bench/verify_tasks.py    # 检查 15 道题本身有没有出错
+uv run python bench/run_bench.py       # 跑全套（约 80 分钟）
+uv run python bench/analyze.py         # 看结果
+```
+
+---
+
+## 目录
+
+```
+examples/22_trunk.py   agent 主体
+bench/                 评测系统：题库、跑批、分析、轨迹视图
+tests/                 100 条测试
+sandbox/               Docker 沙箱镜像
+```
+
+---
+
+## 关于这个项目
+
+跟着一个开源课程（[learn-claude-code](https://github.com/shareAI-lab/learn-claude-code)）做的，20 章讲 agent 的各种机制。但做法和普通跟课不太一样：
+
+- **每一行代码自己手写**，不是抄的。课程用 Anthropic 的接口格式，这里用 OpenAI 格式，每章都要自己翻译一遍。
+- **给自己设了闭卷考试**：学完关键章节就清空编辑器，从空文件重写一遍完整的 agent，不看参考、不用 AI。做过两次。
+- **在教材里找出并修掉了几个缺陷**，另外还有一些是自己写出来的 bug、自己抓到的。
+
+评测系统那部分是课程里没有的，是自己加的。
