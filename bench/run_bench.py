@@ -160,6 +160,8 @@ def merge_traces(traces: list[dict]) -> dict:
         return traces[0]
 
     merged = {"turns": [], "rounds": len(traces)}
+    # 被测对象:各轮当然是同一个,取第一份即可(拿不到就 None,不编)
+    merged["model"] = next((t.get("model") for t in traces if t.get("model")), None)
     for key in ("tokens_loop", "tokens_aux"):
         merged[key] = {}
         for field in ("total", "prompt", "calls"):
@@ -448,6 +450,8 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
         "total": total,
         "pass_rate": round(counts["passed"] / total, 3) if total else 0.0,
         "collect_error": counts["error"] > 0,  # 收集就挂了 ≠ 断言失败
+        # 🔴 被测对象记进每一条:换过端点的批次之间,数据要能自己说清是谁跑的
+        "model": trace.get("model"),
         "steps": steps,
         "rounds": len(rounds),  # 多轮题的 steps/token 是全程累计,不跟单轮题直接比
         "duration_s": duration,

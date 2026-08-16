@@ -56,7 +56,18 @@ spec.loader.exec_module(m)
 # 📌 包装 client 而不改主干 —— 测量问题在 bench 侧解决,主干不为被测而改。
 # ─────────────────────────────────────────────────────────────────────────
 _orig_create = m.client.chat.completions.create
-_trace = {"turns": [], "system_prompt_chars": 0}
+# 🔴 2026-08-16:把【被测对象是谁】记进轨迹。
+# 起因是当事人纠正我一句「我们用的不是 grok4.6,是 composer2.5」——
+# 而我翻遍 results.jsonl 与 trace,【哪里都没记端点】,只能靠人记住。
+# 08-15 那批与这批之间换过端点,历史数据一旦离开当时的对话就再也说不清自己是谁跑的。
+# 🪝 与 CONFIGS 那段「实验配置必须自我说明」是同一条规矩 —— 当时只落实到了消融变量上,
+#    漏了最要紧的那一项:模型本身。
+# ⚠️ 只记模型名。base_url 与 key 一概不进文件 —— 轨迹是要交付、要进仓库的。
+_trace = {
+    "turns": [],
+    "system_prompt_chars": 0,
+    "model": getattr(m, "model", None),
+}
 # 附加层的账:主循环之外那几次【非流式】LLM 调用。
 # 2026-08-15 grep 出 7 个 create 调用点,主干的 TOKEN_USAGE 只覆盖主循环那一个,
 # 漏掉的四处恰恰【就是消融的两个轴】:
