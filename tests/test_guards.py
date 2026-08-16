@@ -209,3 +209,62 @@ def test_worktree_errors_share_one_format(sandbox):
     ]
     for o in outs:
         assert o.startswith("Error: "), f"格式不一致: {o!r}"
+
+
+# ---------- 轨迹记录(T23 可观测性) ----------
+
+
+def test_trace_records_blocked_calls_too(sandbox, tmp_path, monkeypatch):
+    """🔴 被权限挡下的调用【必须】进轨迹 —— 那是最该记的一类事件。
+
+    钉的是注册【顺序】:trigger_hook 遇到第一个非 None 就 return,后面的 hook 不跑;
+    而 permission_hook 拦截时正是返回非 None。所以 trace_pre_hook 排在它后面的话,
+    被拦的调用一条都记不到 —— 而且这种漏【完全静默】,轨迹看起来只是"少了几条"。
+    🪝 安全事件不进审计,等于没有审计。
+    """
+    monkeypatch.setattr(sandbox, "TRACE_DIR", tmp_path / ".traces")
+    monkeypatch.setattr(sandbox, "_trace_events", [])
+
+    blocked = sandbox.trigger_hook("PreToolUse", "bash", {"command": "rm -rf /"})
+    assert blocked is not None, "用例失效:这条命令本该被 DENY_LIST 拦下"
+    sandbox.trigger_hook("PostToolUse", "bash", f"[Tool 'bash' blocked by hook: {blocked}]")
+
+    calls = [e for e in sandbox._trace_events if e["kind"] == "tool_call"]
+    assert calls, "被拦的调用没有进轨迹 —— 检查 trace_pre_hook 的注册顺序"
+    results = [e for e in sandbox._trace_events if e["kind"] == "tool_result"]
+    assert results[-1]["blocked"] is True
+    assert results[-1]["ok"] is False
+
+
+def test_trace_separates_blocked_from_error(sandbox, tmp_path, monkeypatch):
+    """「被安全闸挡下」和「工具自己坏了」不能混成同一个 ok=False。
+
+    前者是闸门生效(好事),后者是代码有病(坏事)。混成一个数,归因时就再也分不开。
+    """
+    monkeypatch.setattr(sandbox, "TRACE_DIR", tmp_path / ".traces")
+    monkeypatch.setattr(sandbox, "_trace_events", [])
+    sandbox.trigger_hook("PostToolUse", "read_file", "Error: file not found")
+    sandbox.trigger_hook("PostToolUse", "bash", "[Tool 'bash' blocked by hook: denied]")
+    err, blk = [e for e in sandbox._trace_events if e["kind"] == "tool_result"]
+    assert (err["ok"], err["blocked"]) == (False, False), "工具报错被误标成 blocked"
+    assert (blk["ok"], blk["blocked"]) == (False, True), "被拦没被标成 blocked"
+
+
+def test_trace_carries_its_own_provenance(sandbox, tmp_path, monkeypatch):
+    """轨迹要能自证出身:哪一版 harness、哪个模型、哪组开关。
+
+    2026-08-16 的教训:模型名没记进 results.jsonl,当事人纠正「不是 grok4.6 是 composer2.5」
+    时,数据自己说不清。轨迹不许重犯。
+    🪝 一份数据离开当时的对话之后,还能不能说清自己是怎么产生的?
+    """
+    import json
+
+    monkeypatch.setattr(sandbox, "TRACE_DIR", tmp_path / ".traces")
+    monkeypatch.setattr(sandbox, "_trace_events", [{"kind": "user", "text": "hi", "t": 0}])
+    sandbox.trigger_hook("Stop", [])
+
+    files = list((tmp_path / ".traces").glob("*.json"))
+    assert files, "Stop 之后轨迹没落盘"
+    t = json.loads(files[0].read_text(encoding="utf-8"))
+    for key in ("harness", "model", "memory_mode", "todo_mode", "sandbox_mode"):
+        assert key in t, f"轨迹缺少出身字段 {key}"

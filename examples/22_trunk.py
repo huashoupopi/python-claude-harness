@@ -822,9 +822,129 @@ def permission_hook(name, args):
     return None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 轨迹记录:把这次会话干了什么落成【结构化】文件,而不是只打到屏幕上
+#
+# 为什么挂 hook 而不是改主循环:hooks 就是主干设计好的扩展点,PreToolUse/PostToolUse
+# 正好卡住工具的进和出。挂上去主循环一行不用改,而且【平时对话和跑批共用同一套】。
+#
+# 为什么不从日志里反解:agent.log 里是 "[tool call] xxx with args: {...}" 这种打印文本,
+# 想拿到结构就得正则去抠 —— 改个打印格式就崩。hook 拿到的是原始对象,不用解析。
+# 🪝 从日志里反解结构,是在为「当初没记下来」还债。
+#
+# TRACE_MODE=off 可关(默认开)。写文件失败一律吞掉 —— 观测不许把被观测的东西搞崩。
+# ─────────────────────────────────────────────────────────────────────────────
+TRACE_MODE = os.getenv("TRACE_MODE", "on")
+TRACE_DIR = WORKDIR / ".traces"
+_trace_events: list[dict] = []
+_trace_pending: dict[str, float] = {}
+
+
+def _harness_version() -> str:
+    """记下【被观测的 harness 是哪一版】。
+
+    今天早上刚吃过一次亏:模型名没记进 results.jsonl,数据说不清自己是谁跑的。
+    同一个病同一个药 —— 轨迹也要能自证出身,否则跨批次比较时又是一笔糊涂账。
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(Path(__file__).parent), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip() or "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def trace_pre_hook(name, args):
+    """工具开跑:记下入参和起始时刻。返回 None —— 记录器绝不拦截。"""
+    if TRACE_MODE != "on":
+        return None
+    _trace_pending[name] = time.time()
+    _trace_events.append(
+        {
+            "kind": "tool_call",
+            "tool": name,
+            "args": {k: str(v)[:500] for k, v in (args or {}).items()},
+            "t": time.time(),
+        }
+    )
+    return None
+
+
+def trace_post_hook(name, result):
+    """工具跑完:记下耗时与结果。
+
+    ⚠️ 耗时用 pop 取起始时刻 —— 同名工具在一轮里被连调时,前一次的时刻不能留下来污染后一次。
+    拿不到起始时刻(比如被 PreToolUse 拦下的那次)就记 None,不编一个 0。
+    """
+    if TRACE_MODE != "on":
+        return None
+    started = _trace_pending.pop(name, None)
+    _trace_events.append(
+        {
+            "kind": "tool_result",
+            "tool": name,
+            "ms": round((time.time() - started) * 1000) if started else None,
+            "result": str(result)[:2000],
+            # 两类「没成」要分开:工具自己抛错 vs 被权限挡下。混成一个 ok=False
+            # 就再也分不出「代码坏了」和「安全闸生效了」—— 后者是好事。
+            "ok": not str(result).startswith("Error:") and "blocked by hook" not in str(result),
+            "blocked": "blocked by hook" in str(result),
+            "t": time.time(),
+        }
+    )
+    return None
+
+
+def trace_prompt_hook(user_query):
+    if TRACE_MODE != "on":
+        return None
+    _trace_events.append({"kind": "user", "text": str(user_query)[:2000], "t": time.time()})
+    return None
+
+
+def trace_stop_hook(messages):
+    """一轮结束:落盘。
+
+    ⚠️ 整段用 try 吞掉异常 —— 观测坏了顶多没有轨迹,不能把 agent 本身搞崩。
+    🪝 收尾函数必须能在「没什么可收」的时候安静返回(同 stop_sandbox)。
+    """
+    if TRACE_MODE != "on" or not _trace_events:
+        return None
+    try:
+        TRACE_DIR.mkdir(parents=True, exist_ok=True)
+        path = TRACE_DIR / f"trace_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "harness": _harness_version(),
+                    "model": model,
+                    "memory_mode": MEMORY_MODE,
+                    "todo_mode": TODO_MODE,
+                    "sandbox_mode": SANDBOX_MODE,
+                    "events": _trace_events,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except (OSError, TypeError, ValueError):
+        pass
+    return None
+
+
+# 🔴 注册顺序在这里【是有语义的】:trigger_hook 遇到第一个非 None 就 return,
+#    后面的 hook 根本不跑。而 permission_hook 拦截时正是返回非 None。
+#    所以 trace_pre_hook 必须排在 permission_hook 【前面】——
+#    否则「被权限挡下的调用」一条都不会进轨迹,而那恰恰是最该记的一类事件。
 register_hook("UserPromptSubmit", context_inject_hook)
+register_hook("UserPromptSubmit", trace_prompt_hook)
+register_hook("PreToolUse", trace_pre_hook)  # ← 必须在 permission_hook 之前
 register_hook("PreToolUse", log_hook)
 register_hook("PreToolUse", permission_hook)
+register_hook("PostToolUse", trace_post_hook)
+register_hook("Stop", trace_stop_hook)
 register_hook("Stop", summary_hook)
 
 
@@ -2476,6 +2596,13 @@ def spawn_subagent(description: str) -> str:
                 if blocked is not None
                 else execute_tool(tc, sub_registry)
             )
+            # 🔴 2026-08-16 补漏:这里原来【只有 PreToolUse,没有 PostToolUse】。
+            # 主循环(:3530)两个都挂了,子 agent 只挂了一半 —— 于是任何靠 hook 做的东西
+            # (审计、耗时统计、轨迹记录)在子 agent 这条线上永远只有「开始调」没有「调完了」。
+            # 🪝 同族函数写法不一致,就是漏的温床(2026-08-15 三轮扫描的同一个形状;
+            #    那三轮没抓到这处,是因为当时找的是「函数写了没人调」,
+            #    而这个是「配对的两个 hook 只挂了一个」—— 换个形状就漏网了)。
+            trigger_hook("PostToolUse", tc.function.name, result)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
     return "[subagent] 达到最大轮次,子任务未完成"
 
@@ -3503,13 +3630,16 @@ def agent_loop(messages: list, context: dict):
             args = json.loads(tc.function.arguments or "{}")
             blocked = trigger_hook("PreToolUse", tc.function.name, args)
             if blocked is not None:
+                denial = f"[Tool '{tc.function.name}' blocked by hook: {blocked}]"
                 messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": f"[Tool '{tc.function.name}' blocked by hook: {blocked}]",
-                    }
+                    {"role": "tool", "tool_call_id": tc.id, "content": denial}
                 )
+                # 🔴 2026-08-16:被拦的调用也要发 PostToolUse。
+                # 原来这里直接 continue,于是「一次调用被权限挡下」这件事对所有
+                # PostToolUse 消费者【完全不可见】—— 而这恰恰是最该被记下的一类事件。
+                # 子 agent 那条路(:2592)是发的,两边写法必须一致。
+                # 🪝 同族函数写法不一致,就是漏的温床(本周第三次)。
+                trigger_hook("PostToolUse", tc.function.name, denial)
                 print(f"[tool blocked] {tc.function.name}: {blocked}")
                 continue
             if should_run_background(tc.function.name, args):
