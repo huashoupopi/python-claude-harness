@@ -34,6 +34,14 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
+# ═════════════════════════════════════════════════════════════════════════════
+# 【第 1 层】配置 · 常量 · 开关
+#   client / WORKDIR / 各种 *_MODE 开关 / SYSTEM 提示词 / skills 扫描
+#   开关是 T22 消融轴的物理实现:MEMORY_MODE / TODO_MODE 三档就是三个实验臂。
+#   ⚠️ skills 在这里只有「扫描」(_scan_skills / list_skills),而「加载」(load_skill)
+#      远在第 9 层 —— 同一个功能被劈成两半,这是本文件该拆包的头号证据。
+# ═════════════════════════════════════════════════════════════════════════════
+
 load_dotenv(override=True)
 
 # ⚠️ 这几行在【模块最外层】,谁 import 本文件谁就立刻执行到这里。
@@ -205,6 +213,14 @@ SUB_SYSTEM = (
 MAX_SUBAGENT_TURNS = 30
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# 【第 2 层】错误恢复
+#   with_retry / 指数退避 / 429 的 Retry-After / 「上下文太长」单独识别
+#   🔑 T18 闭卷考过的核心:错误恢复必须【包住 API 调用】,而不是包住整个 loop。
+#      两条路径不能混:max_tokens 管出口、compact 管入口。
+# ═════════════════════════════════════════════════════════════════════════════
+
+
 class RecoveryState:
     """Track recovery attempts across the loop."""
 
@@ -288,6 +304,15 @@ def is_prompt_too_long_error(e: Exception) -> bool:
         or "context_length_exceeded" in msg
         or "max_context_window" in msg
     )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 【第 3 层】记忆系统
+#   落盘(write/read/list) + 相关性挑选(select_relevant) + 自动提取 + 整合
+#   三档 MEMORY_MODE:none 全关 / self 系统自动挑与提取(模型无感) / official 给模型 memory 工具
+#   📌 T22 stage-3 实测:机制全正常(规矩抓得到、注入 100%),但效应 +2.0 步落在噪声里
+#      —— 「测不出」不等于「没用」,见 bench/STAGE3_NOTES.md §2.2
+# ═════════════════════════════════════════════════════════════════════════════
 
 
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
@@ -574,6 +599,15 @@ def consolidate_memories():
         print(f"[Memory: consolidation failed: {e}]")
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# 【第 4 层】上下文管理 / compact
+#   微压缩 / 反应式压缩 / 工具结果预算 / 大输出落盘 / transcript 落盘
+#   🔑 Anthropic 明说 compaction 不够:压缩只管本轮塞得下,【跨会话传递必须外化成文件】。
+#      write_transcript 落的 .transcripts/*.jsonl 就是那个外化 —— 也是「恢复上一轮对话」
+#      这个待办里难的那一半(已有),缺的只是读回来。
+# ═════════════════════════════════════════════════════════════════════════════
+
+
 def _message_has_tool_use(msg):
     if not msg.get("tool_calls"):
         return False
@@ -734,6 +768,16 @@ def reactive_compact(msgs):
 
 
 HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 【第 5 层】hooks · 权限 · 轨迹
+#   register_hook / trigger_hook / 日志 / 上下文注入 / 权限 / trace 记录器
+#   🔑 T18 Q3 的答案:【权限不是独立一层,它是 PreToolUse hook 的一个实现】。
+#   ⚠️ trigger_hook 遇到第一个非 None 就 return —— 所以【注册顺序有语义】:
+#      trace_pre_hook 必须排在 permission_hook 前面,否则被拦的调用不会被记录。
+#      本层末尾那几行 register_hook(...) 的顺序不是随手写的。
+# ═════════════════════════════════════════════════════════════════════════════
 
 
 def register_hook(event: str, callback):
@@ -959,6 +1003,15 @@ register_hook("PreToolUse", permission_hook)
 register_hook("PostToolUse", trace_post_hook)
 register_hook("Stop", trace_stop_hook)
 register_hook("Stop", summary_hook)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 【第 6 层】状态系统:任务 / worktree / cron
+#   任务(s12-13):Task 模型 + 两道闸(can_start 依赖闸、claim 抢占闸)+ 崩溃恢复
+#   worktree(s18):git 隔离目录的生命周期
+#   cron(s14):表达式解析 + 调度线程 + 持久化
+#   🔑 这三件的共同点:它们是 agent 的【持久状态】,活得比一次对话长 —— 所以都要落盘。
+# ═════════════════════════════════════════════════════════════════════════════
 
 
 class TaskStatus(StrEnum):
@@ -1434,6 +1487,14 @@ def start_cron_scheduler():
     load_durable_jobs()
     threading.Thread(target=cron_scheduler_loop, daemon=True).start()
     print("  \033[35m[cron] scheduler thread started\033[0m")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 【第 7 层】团队协作
+#   MessageBus(s15) / 请求-响应协议(s16) / 自治空转轮询(s17) / teammate 线程
+#   🔑 与第 6 层的分工:第 6 层是「一个 agent 的状态」,这一层是「多个 agent 之间的通信」。
+#   ⚠️ 已知不一致:主 agent 已流式,spawn_teammate_thread 这条线仍是非流式(BACKLOG 有记)。
+# ═════════════════════════════════════════════════════════════════════════════
 
 
 class MessageBus:
@@ -2020,6 +2081,15 @@ def run_check_inbox() -> str:
     return "\n".join(lines)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# 【第 8 层】工具的参数 schema(Pydantic)
+#   27 个工具的入参定义。它们【不是文档,是发给模型的东西】——
+#   每轮请求都要带上,实测工具 schema 共 11,091 字符 ≈ 每轮 4,000 token 固定开销。
+#   🔑 T19 综合验收的教训:这个开销把 deepseek-v4-flash 压到输出退化(混语言、泄漏
+#      </think>)。→「工具池按任务裁剪」从优化项变必需项,即 OpenAI tool_search 的动机。
+# ═════════════════════════════════════════════════════════════════════════════
+
+
 class BashArgs(BaseModel):
     command: str = Field(..., description="the shell command to run")
     run_in_background: bool = Field(
@@ -2172,6 +2242,17 @@ class RemoveWorktreeArgs(BaseModel):
 
 class KeepWorktreeArgs(BaseModel):
     name: str = Field(..., description="the name of the worktree to keep")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 【第 9 层】工具的实现
+#   沙箱(docker 起停) → bash / 文件读写改 / glob / todo → memory tool 的七个子命令
+#   → 子 agent → skill 加载 → 任务·cron·worktree 的 run_* 薄壳 → MCP(client/stdio/mock)
+#   🔑 沙箱在最前面不是巧合:bash 是万能工具,进程内的细粒度权限对它无效
+#      (真事:write_file 被拦下后,模型改用 `bash echo x > 越界路径` 写成功了)
+#      → 黑名单/白名单都是「列举」,而攻击面不可穷举;只有隔离是构造性的。
+#   ⚠️ 本层混着五六个不同主题,是全文件最该先拆的一段。
+# ═════════════════════════════════════════════════════════════════════════════
 
 
 def start_sandbox() -> str:
@@ -3005,6 +3086,15 @@ def run_connect_mcp(name: str) -> str:
     return connect_mcp_name(name)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# 【第 10 层】工具注册表 · 工具池组装
+#   ToolEntry 四元组(description/schema/validator/handler)+ builtin() 工厂 + 27 个注册
+#   🔑 T17 还清的 schema 债:原来是三元组散着放,重构成 NamedTuple 之后,
+#      内置工具的 validator = Pydantic 类,MCP 工具的 validator = None —— 一张表容下两种来源。
+#   ⚠️ MCP 那边曾有坑:lambda 默认参数可被外部 server 劫持 → 改用闭包工厂。
+# ═════════════════════════════════════════════════════════════════════════════
+
+
 class ToolEntry(NamedTuple):
     description: str
     schema: dict
@@ -3179,6 +3269,14 @@ PROMPT_SECTIONS = {
 }
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# 【第 11 层】prompt 组装 · 上下文状态
+#   按当前 context 挑 prompt 段落拼成 system prompt;update_context 维护那个 context
+#   🔑 这一层回答的是「模型每轮到底看到什么」。system prompt 848 字符,
+#      加上第 8 层的工具 schema 才是完整的每轮固定开销。
+# ═════════════════════════════════════════════════════════════════════════════
+
+
 def assemble_system_prompt(context: dict) -> str:
     """Select and join prompt sections based on current context."""
     sections = []
@@ -3281,6 +3379,15 @@ _bg_counter = 0
 background_tasks: dict[str, dict] = {}  # bg_id → {tool_use_id, command, status}
 background_results: dict[str, str] = {}  # bg_id → output
 background_lock = threading.Lock()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 【第 12 层】工具分发执行 · 后台任务
+#   execute_tool(校验参数 → 触发 hooks → 调 handler)/ 慢命令丢后台 / 回收结果
+#   🔑 计步口径就在这层:`[tool call]` 打印在 execute_tool 里,【不在 agent_loop 里】
+#      —— 所以 T20 的流式改造不影响 bench 计步,stage-1 基线不作废。
+#   🔑 后台任务是【外部异步唯一的入口】:结果只能在下次调 LLM 之前塞回 messages。
+# ═════════════════════════════════════════════════════════════════════════════
 
 
 def should_run_background(tc_name: str, tc_args: dict) -> bool:
@@ -3400,6 +3507,17 @@ def collect_background_results() -> list[str]:
 
 session_context: dict | None = None
 session_history: list | None = None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 【第 13 层】会话 · 流式 · agent loop · 入口
+#   init_session / assemble_tools / accumulate_stream / agent_loop / main
+#   🔑 整个文件的其余 12 层都是为这一层服务的 —— agent_loop 就是那个「循环」,
+#      前面所有东西都挂在它的某个位置上(T18 那张「组件在循环中的位置」12 格表)。
+#   🔑 模块级零副作用是 T18.5 买下的:建目录 / 起 cron 线程 / 建会话初态全收进
+#      ensure_dirs / start_cron_scheduler / init_session —— 所以本文件可以被 import
+#      而不启动任何东西,100 条测试和 bench 都靠这个前提。
+# ═════════════════════════════════════════════════════════════════════════════
 
 
 def init_session():
