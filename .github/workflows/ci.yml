@@ -7,7 +7,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      # ⚠️ 这里必须写完整版本号:@v10 解析不了。
+      # 「major 浮动 tag(v10 指向最新的 v10.x)」是【惯例,不是保证】——
+      # checkout 维护了 v7,而 setup-uv 从 v8 起就不再维护 v8/v9/v10 这种浮动 tag,
+      # 仓库里只有 v10.0.1 / v10.0.0。查 latest release 拿到 v10.0.1 就写 @v10,是想当然。
+      - uses: astral-sh/setup-uv@v10.0.1
       - run: uv sync --dev
       # 沙箱那几条测试要真起容器。不 build 的话镜像不存在,docker run 报 exit 125。
       # 测试侧现在有守卫会自动 skip(见 tests/test_sandbox.py::_image_ready),
