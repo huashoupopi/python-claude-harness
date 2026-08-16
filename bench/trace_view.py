@@ -128,11 +128,25 @@ def add_thinking(rows: list[dict]) -> list[dict]:
     中间那段,harness 就是在等模型。每个事件都记了时间戳 t,一减就有,不用加任何探针。
 
     🪝 缺的量不一定要新加测点:先看现有的量之间能不能【减出来】。
-    ⚠️ 只在两个工具之间插。开头那段(用户提问→第一个工具)也是思考时间,同样算进去。
+
+    🔴 2026-08-16 修:开头那段【原来漏了】。prev_end 初值是 None,于是
+       「用户提问 → 第一个工具调用」整段被跳过 —— 实测一条普通对话漏掉 8.8s / 37.1s,
+       接近四分之一,而视图还报得像是算全了。
+       更糟的是这个函数的注释当时写着「开头那段同样算进去」——【注释说了,代码没做】。
+       🪝 注释写了 ≠ 代码做了,而注释比代码更容易被人当成事实
+          (同族:「规则写在 prompt 里 ≠ 规则被执行」)。
+       现在拿 user 事件的时间戳当起点。没有 user 事件时(比如从中间截取的轨迹)
+       仍从第一个工具开始算 —— 拿不到就不编。
+
+    ⚠️ 仍未计入的一段:最后一个工具结束 → 模型给出最终回答。
+       hook 里没有「本轮结束」的时刻(Stop 是整个会话结束),这段拿不到,
+       所以【报出来的思考时间是下界,不是全部】。宁可报少并说明,不要凑一个数。
     """
     out, prev_end = [], None
     for r in rows:
-        if r.get("kind") == "pair":
+        if r.get("kind") == "user":
+            prev_end = r.get("t", prev_end)  # 开头那段的起点
+        elif r.get("kind") == "pair":
             start = r.get("t_call")
             if prev_end is not None and start is not None and start > prev_end:
                 out.append({"kind": "think", "ms": round((start - prev_end) * 1000)})
