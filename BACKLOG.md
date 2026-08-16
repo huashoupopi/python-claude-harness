@@ -47,13 +47,17 @@
       100 条塌 88 条，活下来的 12 条正是 07-06 那次绿灯的 12 条。
       顺带修了沙箱守卫（只查 daemon 没查镜像）。现在 CI 真跑当前代码 = **100 passed**。
 
-- [ ] **`verify_tasks.py` 要不要进 CI** —— 待定，**没夹带进这次修复**
-      价值：16 道题的「原题红 + 答案绿」自动验证，防改题改坏；今天刚抓到过 t15 flaky
-      成本：闸门每题连判 5 次 ≈ 96 次 pytest 调用，CI 会从 36s 涨到 2-3 分钟
-      📌 决定权在当事人：值不值这个时间
+- [x] ~~**`verify_tasks.py` 进 CI**~~ —— **已做**（`a064d7c`+`3940a99`）
+      补的空白：**`pytest` 完全不看 `bench/tasks/`**，16 道题被改坏没有任何东西会发现
+      连判次数做成 `VERIFY_REPEATS`，**CI 里设 1**：默认的 5 次是抓 flaky 的，
+      而 flaky 靠「每进程哈希种子不同」，本地跑 5 次和 CI 跑 5 次是同一件事 ——
+      CI 多跑那 4 次纯属重复本地做过的事。**实测 CI 整轮 48s**（原估 2-3 分钟）
 
-- [ ] 🟢 `actions/checkout@v4` / `astral-sh/setup-uv@v3` 报 Node.js 20 deprecated
-      现在被强制跑在 Node 24 上，**不影响绿灯**，升到 v5 即可消除警告
+- [x] ~~🟢 Node.js 20 deprecated 警告~~ —— **已消**：`checkout` v4→**v7**、`setup-uv` v3→**v10.0.1**
+      🪝 踩到一个坑值得记：**major 浮动 tag 是惯例，不是保证**。
+      查 latest release 拿到 `v10.0.1` 就写 `@v10` → `Unable to resolve action`。
+      实际 tag 列表里 `checkout` 维护了 `v7`，而 `setup-uv` **从 v8 起就不维护** `v8`/`v9`/`v10`。
+      → **写 action 版本前先看它到底有哪些 tag，别从 release 号推。**
 
 ---
 
