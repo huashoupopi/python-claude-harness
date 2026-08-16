@@ -21,7 +21,14 @@ def test_chunk_covers_every_item():
 
 
 def test_dedupe_keeps_first_seen_order():
-    assert dedupe(["b", "a", "b", "c", "a"]) == ["b", "a", "c"]
+    # 用 8 个元素而不是 3 个:被测实现是 list(set(...)),而 set 的顺序取决于
+    # 字符串哈希,Python 每个进程的哈希种子是随机的。3 个元素只有 6 种排列,
+    # 【约六分之一的概率会蒙对】—— 实测 30 次蒙对 5 次。
+    # 元素多了之后蒙对概率降到 1/8! ≈ 0.0025%,这条测试才真的在测东西。
+    # 🪝 一条有概率自己变绿的测试,比没有这条测试更糟:它让错的实现有时能过关。
+    assert dedupe(["h", "b", "a", "h", "d", "c", "b", "f", "g", "e", "a"]) == [
+        "h", "b", "a", "d", "c", "f", "g", "e",
+    ]
 
 
 def test_flatten_removes_one_level():

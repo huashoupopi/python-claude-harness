@@ -135,6 +135,42 @@ def task_rounds(task_dir: Path) -> list[Path]:
     return rounds
 
 
+RESET_MARKER = "reset_between_rounds"
+
+
+def reset_workspace(task_dir: Path, repo: Path) -> None:
+    """把考场恢复成原卷,但【保留所有点开头的东西】。
+
+    只有放了 reset_between_rounds 标记的题才会走这里。
+
+    为什么要有这个:t13-t15 三道多轮题测出记忆轴是零,诊断出来的原因是
+    「第二轮还能看见上一轮改过的代码」—— 于是测的其实是「要不要重新推一遍」,
+    而重推只要读 2-3 个文件,成本淹在噪声里。
+    🪝 效应量小于噪声,不叫「没有效应」,叫【实验设计废了】。
+
+    🔴 保留点开头的东西是这个函数的全部意义所在:
+        .memory/     ← 整个实验就靠它跨轮,删了这道题就白出了
+        .traces/     ← 轨迹要连着看
+        .bench_trace_r1.json ← 上一轮的账,删了 token 就少算一半
+    ⚠️ 所以不能图省事 rmtree 整个 repo 再重拷。
+    """
+    for entry in repo.iterdir():
+        if entry.name.startswith("."):
+            continue
+        if entry.is_dir():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink(missing_ok=True)
+    for src in (task_dir / "repo").iterdir():
+        dst = repo / src.name
+        if src.is_dir():
+            shutil.copytree(src, dst, ignore=IGNORE_CACHES)
+        elif src.name not in ("__pycache__",):
+            shutil.copy2(src, dst)
+    if SKILLS_SRC.exists():
+        shutil.copytree(SKILLS_SRC, repo / "skills", dirs_exist_ok=True)
+
+
 def read_trace(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -378,7 +414,11 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
         # 多轮题:每一轮 = 一个【独立进程】,messages 从零开始,
         # 靠留在考场里的 .memory 把上一轮的东西带过来 —— 这正是记忆轴要测的东西。
         # ⚠️ 每轮跑完立刻把轨迹改名存下来,否则下一轮会把它【覆盖掉】。
+        resets = (task_dir / RESET_MARKER).exists()
         for index, prompt_file in enumerate(rounds, start=1):
+            # 第二轮起,若这道题要求重置,就把代码线索清零(.memory 等点开头的留着)
+            if index > 1 and resets:
+                reset_workspace(task_dir, repo)
             try:
                 proc = subprocess.run(
                     [sys.executable, str(RUNNER), str(prompt_file.resolve())],
