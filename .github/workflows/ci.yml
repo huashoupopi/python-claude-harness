@@ -9,4 +9,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
       - run: uv sync --dev
+      # 沙箱那几条测试要真起容器。不 build 的话镜像不存在,docker run 报 exit 125。
+      # 测试侧现在有守卫会自动 skip(见 tests/test_sandbox.py::_image_ready),
+      # 但【在 CI 里我们要的是真跑,不是跳过】—— 跳过等于绿灯不保护沙箱,
+      # 而这个仓库刚因为「绿灯不保护任何东西」栽过一次(CI 化石在 07-06)。
+      - run: docker build -t harness-sandbox:1 sandbox/
       - run: uv run pytest -q

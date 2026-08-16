@@ -21,6 +21,7 @@
 📌 为什么用真实案例当验收:抽象的「越界命令被挡下」没法判断做没做到 —— 这两条能。
 """
 
+import importlib.util
 import shutil
 import subprocess
 from pathlib import Path
@@ -28,6 +29,7 @@ from pathlib import Path
 import pytest
 
 DOCKER = shutil.which("docker")
+TRUNK = Path(__file__).parent.parent / "examples" / "22_trunk.py"
 REAL_SOLUTION = (
     Path(__file__).parent.parent
     / "bench/tasks/t08_wide_validators/solution/check_email.py"
@@ -43,8 +45,40 @@ def _daemon_up() -> bool:
         return False
 
 
+def _sandbox_image() -> str:
+    """镜像名的【唯一真相】在主干 SANDBOX_IMAGE,这里不复制那个默认值。
+
+    为一个常量装载整个主干确实重(几十毫秒),但代价是可预期的;
+    复制一份 "harness-sandbox:1" 的代价是【改名字那天守卫悄悄失效】,
+    而那种代价发现不了。仓里已经欠着「两份黑名单」的债,不再添第三份。
+    """
+    spec = importlib.util.spec_from_file_location("_guard_trunk", TRUNK)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m.SANDBOX_IMAGE
+
+
+def _image_ready() -> bool:
+    """⚠️ daemon 活着 ≠ 沙箱能跑 —— 还得镜像真的 build 过。
+
+    2026-08-16 CI 实测:runner 上 docker 装了、daemon 也起着,于是旧守卫放行,
+    结果 `docker run` 撞上【不存在的镜像】,exit 125,两条测试红在 CI 上。
+    本机一直绿,只是因为本机早就 build 过。
+    🪝 同族(今天第二次):代码依赖了「当前环境恰好有某个东西」。
+    """
+    if not _daemon_up():
+        return False
+    try:
+        return subprocess.run(
+            [DOCKER, "image", "inspect", _sandbox_image()], capture_output=True, timeout=10
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 needs_docker = pytest.mark.skipif(
-    not _daemon_up(), reason="需要 docker daemon(OrbStack/Docker Desktop 要先启动)"
+    not _image_ready(),
+    reason="需要 docker daemon + 已 build 的沙箱镜像(docker build -t harness-sandbox:1 sandbox/)",
 )
 
 
