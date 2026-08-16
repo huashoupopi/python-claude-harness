@@ -43,6 +43,13 @@ WORKERS = int(os.getenv("BENCH_WORKERS", "4"))
 TRIALS = int(os.getenv("BENCH_TRIALS", "3"))
 DRY_RUN = os.getenv("BENCH_DRY_RUN") == "1"
 
+# 只跑指定的题/臂(逗号分隔的【子串】匹配),留空 = 全跑。
+# 用途是冒烟:新改了跑批逻辑,先花 2 分钟跑【一个】单元验代码路径,
+# 而不是拿 225 个单元去赌一条从没执行过的分支。
+# 📌 留空时行为与加这两个开关之前完全一致。
+ONLY_TASKS = [s for s in os.getenv("BENCH_ONLY_TASKS", "").split(",") if s]
+ONLY_CONFIGS = [s for s in os.getenv("BENCH_ONLY_CONFIGS", "").split(",") if s]
+
 # 🔴 2026-08-15:演习和实弹的目录名要分开。
 # 踩过的坑:两者混在 runs/ 里,而 analyze.py 默认取【最新那批】——
 # 跑一次 dry-run 再跑分析,它就会去分析那批「完美考生」的假数据(全 8/8、steps 全 0)。
@@ -483,23 +490,37 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
     return record
 
 
+def _wanted(text: str, patterns: list[str]) -> bool:
+    return not patterns or any(p in text for p in patterns)
+
+
+all_tasks = [td for td in sorted(TASKS_DIR.iterdir()) if td.is_dir()]
+tasks = [td for td in all_tasks if _wanted(td.name, ONLY_TASKS)]
+configs = {k: v for k, v in CONFIGS.items() if _wanted(k, ONLY_CONFIGS)}
+
 units = [
     (name, env_patch, trial, task_dir)
-    for name, env_patch in CONFIGS.items()
+    for name, env_patch in configs.items()
     for trial in range(1, TRIALS + 1)
-    for task_dir in sorted(TASKS_DIR.iterdir())
-    if task_dir.is_dir()
+    for task_dir in tasks
 ]
+if not units:
+    raise SystemExit(
+        f"过滤之后一个单元都不剩 —— BENCH_ONLY_TASKS={ONLY_TASKS} "
+        f"BENCH_ONLY_CONFIGS={ONLY_CONFIGS}\n"
+        f"可选题目: {[t.name for t in all_tasks]}\n可选臂: {list(CONFIGS)}"
+    )
 
 run_dir.mkdir(parents=True, exist_ok=True)
 # 每题满分几条 —— 由标准答案实跑派生,不写常量(题目加测试时自动跟上)
-EXPECTED = {
-    td.name: expected_total(td) for td in sorted(TASKS_DIR.iterdir()) if td.is_dir()
-}
+# ⚠️ 只给【这一轮真的要跑的】题算,否则冒烟一道题也要陪跑 15 次 pytest。
+EXPECTED = {td.name: expected_total(td) for td in tasks}
 print(
     f"{'[DRY RUN] ' if DRY_RUN else ''}"
-    f"{len(units)} 个单元 = {len(CONFIGS)} 臂 × {TRIALS} trial × "
-    f"{len(units) // (len(CONFIGS) * TRIALS)} 题,并发 {WORKERS},输出 {run_dir}"
+    f"{len(units)} 个单元 = {len(configs)} 臂 × {TRIALS} trial × {len(tasks)} 题,"
+    f"并发 {WORKERS},输出 {run_dir}"
+    + (f"\n⚠️ 已过滤:题={ONLY_TASKS or '全部'} 臂={ONLY_CONFIGS or '全部'}"
+       if ONLY_TASKS or ONLY_CONFIGS else "")
 )
 
 # 🔒 藏答案:跑之前把 solution/ 整个移出项目树,跑完还回去(泄漏的第二道锁,见 §61)。
