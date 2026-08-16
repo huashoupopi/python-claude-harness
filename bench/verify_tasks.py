@@ -14,6 +14,7 @@
     tasks/<题名>/grade.sh    判分,第一个参数 = 考场路径
 """
 
+import os
 import re
 import shutil
 import subprocess
@@ -77,7 +78,11 @@ for task_dir in sorted(TASKS_DIR.iterdir()):
     # 后果不是「数字不稳」这么轻:它让【没修 bug 的实现有时能过关】。
     # 🪝 一条有概率自己变绿的测试,比没有这条测试更糟。
     # 单跑一次是抓不到的 —— 抓它的唯一办法就是多跑几次看结果一不一样。
-    REPEATS = 5
+    # 📌 CI 里设 VERIFY_REPEATS=1:连判 5 次抓的是 flaky,而 flaky 靠的是
+    #    「每个进程哈希种子不同」—— 本地跑 5 次和 CI 跑 5 次是同一件事,CI 多跑纯属重复。
+    #    CI 要的是另一件价值:pytest 完全不看 bench/tasks/,题库被改坏没有任何东西会发现。
+    #    那件事跑 1 次就拿到了。
+    REPEATS = int(os.getenv("VERIFY_REPEATS", "5"))
     reds = []
     for _ in range(REPEATS):
         with tempfile.TemporaryDirectory() as td:

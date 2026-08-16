@@ -6,8 +6,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
       - run: uv sync --dev
       # 沙箱那几条测试要真起容器。不 build 的话镜像不存在,docker run 报 exit 125。
       # 测试侧现在有守卫会自动 skip(见 tests/test_sandbox.py::_image_ready),
@@ -15,3 +15,7 @@ jobs:
       # 而这个仓库刚因为「绿灯不保护任何东西」栽过一次(CI 化石在 07-06)。
       - run: docker build -t harness-sandbox:1 sandbox/
       - run: uv run pytest -q
+      # 题库双头验:pytest 完全不看 bench/tasks/,16 道题被改坏没有任何东西会发现。
+      # VERIFY_REPEATS=1 —— 默认的 5 次连判是抓 flaky 的,那靠「每进程哈希种子不同」,
+      # 本地跑 5 次和 CI 跑 5 次是同一件事,CI 多跑只是把 30 秒拖成 2-3 分钟。
+      - run: VERIFY_REPEATS=1 uv run python bench/verify_tasks.py
