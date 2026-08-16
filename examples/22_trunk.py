@@ -861,11 +861,16 @@ def trace_pre_hook(name, args):
     if TRACE_MODE != "on":
         return None
     _trace_pending[name] = time.time()
+    # ⚠️ 参数要截断(write_file 的正文能有几千字符,不截会把轨迹文件撑爆),
+    #    但【真实长度必须单独记下】—— 否则下游看到的长度是我自己截出来的产物,
+    #    「写了 500 字符」和「写了 3000 字符被我截成 500」是两回事。
+    # 🪝 截断可以,但不能让截断后的数据看起来像原始数据。
     _trace_events.append(
         {
             "kind": "tool_call",
             "tool": name,
             "args": {k: str(v)[:500] for k, v in (args or {}).items()},
+            "arg_lens": {k: len(str(v)) for k, v in (args or {}).items()},
             "t": time.time(),
         }
     )
