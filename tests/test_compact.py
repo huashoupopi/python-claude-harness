@@ -320,12 +320,12 @@ def test_teammate_truncation_keeps_pairs(trunk):
 # ---------------------------------------------------------------------------
 
 
-def test_estimate_size_is_chars_divided_by_four(trunk):
-    """estimate_size 与 CONTEXT_LIMIT 必须同一单位(token=字符/4)。只改一边会让 L4 更难触发。"""
+def test_estimate_tokens_is_chars_divided_by_four(trunk):
+    """estimate_tokens 与 CONTEXT_LIMIT_TOKENS 必须同一单位(token=字符/4)。只改一边会让 L4 更难触发。"""
     msgs = [{"role": "user", "content": "abcd" * 250}]
     chars = len(str(msgs))
-    assert trunk.estimate_size(msgs) == chars // 4
-    assert trunk.CONTEXT_LIMIT == int(
+    assert trunk.estimate_tokens(msgs) == chars // 4
+    assert trunk.CONTEXT_LIMIT_TOKENS == int(
         trunk.MODEL_CONTEXT_TOKENS * trunk.COMPACT_TRIGGER_RATIO
     )
 
@@ -353,8 +353,8 @@ def test_default_limit_does_not_compact_small_history(trunk):
 
 
 def test_lowered_token_limit_triggers_l4(sandbox, monkeypatch):
-    """MODEL_CONTEXT_TOKENS=2000 同款:CONTEXT_LIMIT=1600 token 时,纯长文本必须触发 L4。"""
-    monkeypatch.setattr(sandbox, "CONTEXT_LIMIT", 1600)
+    """MODEL_CONTEXT_TOKENS=2000 同款:CONTEXT_LIMIT_TOKENS=1600 token 时,纯长文本必须触发 L4。"""
+    monkeypatch.setattr(sandbox, "CONTEXT_LIMIT_TOKENS", 1600)
     monkeypatch.setattr(sandbox, "compact_failures", 0)
     called = []
 
@@ -367,7 +367,7 @@ def test_lowered_token_limit_triggers_l4(sandbox, monkeypatch):
         {"role": "system", "content": "s"},
         {"role": "user", "content": "x" * 8000},
     ]
-    assert sandbox.estimate_size(msgs) > 1600
+    assert sandbox.estimate_tokens(msgs) > 1600
     sandbox.try_compact(msgs)
     assert called, "调低阈值后 L4 没出手"
     assert msgs[0]["role"] == "system"
@@ -380,7 +380,7 @@ def test_compact_trace_keeps_chars_and_tokens(sandbox, tmp_path, monkeypatch):
     monkeypatch.setattr(sandbox, "TRACE_MODE", "on")
     monkeypatch.setattr(sandbox, "TRACE_DIR", tmp_path / ".traces")
     monkeypatch.setattr(sandbox, "_trace_events", [])
-    monkeypatch.setattr(sandbox, "CONTEXT_LIMIT", 1600)
+    monkeypatch.setattr(sandbox, "CONTEXT_LIMIT_TOKENS", 1600)
     monkeypatch.setattr(sandbox, "compact_failures", 0)
     monkeypatch.setattr(
         sandbox,
@@ -416,7 +416,7 @@ def test_repl_compact_force_rewrites_history(sandbox, monkeypatch):
         {"role": "system", "content": "s"},
         {"role": "user", "content": "short"},
     ]
-    assert sandbox.estimate_size(history) <= sandbox.CONTEXT_LIMIT
+    assert sandbox.estimate_tokens(history) <= sandbox.CONTEXT_LIMIT_TOKENS
     consumed = sandbox.handle_repl_command("/compact", history)
     assert consumed is True
     assert history[1]["content"].startswith("[Compacted]")

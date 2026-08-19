@@ -77,7 +77,7 @@ MAX_GLOB_RESULTS = 200
 # 比例留给本轮输出和下轮输入;压满再压只会撞 API 400,那就只能走 reactive。
 MODEL_CONTEXT_TOKENS = int(os.getenv("MODEL_CONTEXT_TOKENS", "131072"))
 COMPACT_TRIGGER_RATIO = float(os.getenv("COMPACT_TRIGGER_RATIO", "0.8"))
-CONTEXT_LIMIT = int(MODEL_CONTEXT_TOKENS * COMPACT_TRIGGER_RATIO)
+CONTEXT_LIMIT_TOKENS = int(MODEL_CONTEXT_TOKENS * COMPACT_TRIGGER_RATIO)  # 单位: token
 KEEP_RECENT = 3
 PERSIST_THRESHOLD = 30000
 MEMORY_TYPES = ["user", "feedback", "project", "reference"]
@@ -3665,8 +3665,8 @@ def _chars_of(msgs) -> int:
     return len(str(msgs))
 
 
-def estimate_size(msgs) -> int:
-    """token 估算 = 字符数 / 4。不引入 tokenizer。"""
+def estimate_tokens(msgs) -> int:
+    """返回 token 估算(字符数 / 4)。不引入 tokenizer。"""
     return _chars_of(msgs) // 4
 
 
@@ -3699,7 +3699,7 @@ def try_compact(msgs, force=False):
     chars_before = _chars_of(msgs)
     n_before = len(msgs)
     tokens = chars_before // 4
-    if tokens > CONTEXT_LIMIT or force:
+    if tokens > CONTEXT_LIMIT_TOKENS or force:
         if compact_failures < MAX_COMPACT_RETRIES:
             print("[auto-compact]")
             assert msgs[0]["role"] == "system", "First message must be system prompt"
