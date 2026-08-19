@@ -235,6 +235,21 @@ def main():
                 f"{paint(str(r.get('reason')), 'dim')}"
             )
             continue
+        if r.get("kind") == "token_calibration":
+            est = r.get("estimated_tokens")
+            act = r.get("prompt_tokens")
+            print(
+                paint(
+                    f"  CAL turn={r.get('turn')}  est={est}  actual={act}"
+                    + (
+                        f"  bias={act / est:.2f}"
+                        if est
+                        else ""
+                    ),
+                    "dim",
+                )
+            )
+            continue
         if r.get("kind") == "think":
             # 思考时间只在【值得注意】时才占一行 —— 每一步都印会把工具淹掉
             if r["ms"] >= 1000:

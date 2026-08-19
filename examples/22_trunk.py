@@ -2738,6 +2738,7 @@ def spawn_subagent(description: str) -> str:
         #    写了也是空转;而 mini-bench 八道题没有一道会触发 spawn_subagent,
         #    现在补它等于为一条跑不到的路径花时间。等主循环的数据出来再说。
         text, tool_calls, _finish, _usage = accumulate_stream(stream)
+        _record_token_calibration(messages, _usage)
         messages.append(build_message(text, tool_calls))
         calls = [tc for _, tc in sorted(tool_calls.items())]
         if not calls:
@@ -3659,6 +3660,7 @@ rounds_since_todo = 0
 MAX_REACTIVE_RETRIES = 1  # retry limit for reactive compact
 MAX_COMPACT_RETRIES = 3  # retry limit for compact_history
 compact_failures = 0
+_current_turn = None
 
 
 def _chars_of(msgs) -> int:
@@ -3668,6 +3670,58 @@ def _chars_of(msgs) -> int:
 def estimate_tokens(msgs) -> int:
     """返回 token 估算(字符数 / 4)。不引入 tokenizer。"""
     return _chars_of(msgs) // 4
+
+
+def _record_token_calibration(msgs, usage, turn=None):
+    """记下估算 vs API 真实 prompt_tokens。不改估算公式。"""
+    if TRACE_MODE != "on" or usage is None:
+        return
+    actual = getattr(usage, "prompt_tokens", None)
+    if actual is None:
+        return
+    _trace_events.append(
+        {
+            "kind": "token_calibration",
+            "turn": turn if turn is not None else _current_turn,
+            "estimated_tokens": estimate_tokens(msgs),
+            "prompt_tokens": int(actual),
+            "t": time.time(),
+        }
+    )
+
+
+def summarize_token_calibration(events=None) -> dict:
+    """偏差比 = 真实 prompt_tokens / 估算。>1 表示秤低估。"""
+    src = _trace_events if events is None else events
+    cals = [e for e in src if e.get("kind") == "token_calibration"]
+    est = sum(int(e.get("estimated_tokens") or 0) for e in cals)
+    act = sum(int(e.get("prompt_tokens") or 0) for e in cals)
+    return {
+        "n": len(cals),
+        "estimated_tokens": est,
+        "prompt_tokens": act,
+        "bias": round(act / est, 3) if est else None,
+    }
+
+
+def _install_nonstream_calibration():
+    raw = client.chat.completions.create
+    if getattr(raw, "_calib_wrapped", False):
+        return
+
+    def wrapped(**kwargs):
+        resp = raw(**kwargs)
+        if not kwargs.get("stream"):
+            _record_token_calibration(
+                kwargs.get("messages") or [], getattr(resp, "usage", None)
+            )
+        return resp
+
+    wrapped._calib_wrapped = True
+    client.chat.completions.create = wrapped
+
+
+_install_nonstream_calibration()
 
 
 def _record_compact_event(layer, reason, chars_before, n_before, msgs):
@@ -3720,6 +3774,7 @@ def agent_loop(messages: list, context: dict):
     reactive_retries = 0
     global compact_failures
     global rounds_since_todo
+    global _current_turn
     # 进门先按【当前 messages】重算一次 context:传进来的那份是上一轮末尾算的,
     # 还不含本轮的 user 消息 —— self 模式下会因此选不出相关记忆(第一轮尤其明显)。
     # 有 _memories_cache 兜着,这一次不会额外多调 LLM。
@@ -3734,6 +3789,7 @@ def agent_loop(messages: list, context: dict):
     TOOLS_Registry, TOOLS = assemble_tools()
     state = RecoveryState()
     for turn in range(max_turns):
+        _current_turn = turn
         pre_compress = [dict(m) for m in messages]
         cb, nb = _chars_of(messages), len(messages)
         messages[:] = tool_result_budget(messages)  # L3: persist large results first
@@ -3780,6 +3836,7 @@ def agent_loop(messages: list, context: dict):
                 TOKEN_USAGE["cached"] += _usage_cached_tokens(usage)
                 if _usage_cached_field_present(usage):
                     TOKEN_USAGE["cached_reported"] += 1
+                _record_token_calibration(messages, usage, turn=turn)
             reactive_retries = 0
         except Exception as e:
             # 🔴 2026-08-15 修:原来这里是手写的两个关键词判断

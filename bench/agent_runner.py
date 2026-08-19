@@ -154,6 +154,14 @@ finally:
     #    合成一个总数就再也拆不开了。
     _trace["tokens_loop"] = dict(getattr(m, "TOKEN_USAGE", {}))
     _trace["tokens_aux"] = dict(_aux)
+    cals = [
+        e
+        for e in getattr(m, "_trace_events", [])
+        if isinstance(e, dict) and e.get("kind") == "token_calibration"
+    ]
+    _trace["token_calibration"] = cals
+    if hasattr(m, "summarize_token_calibration"):
+        _trace["token_estimate"] = m.summarize_token_calibration(cals)
     # finally:超时被 kill 之外的任何退出路径都要留下轨迹 ——
     # 崩溃那次的轨迹恰恰最该看(㉚:success 会骗人,只有轨迹说实话)
     TRACE_PATH.write_text(json.dumps(_trace, ensure_ascii=False), encoding="utf-8")

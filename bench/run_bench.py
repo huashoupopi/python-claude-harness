@@ -215,6 +215,9 @@ def merge_traces(traces: list[dict]) -> dict:
         merged["turns"][-1] = dict(merged["turns"][-1])
         merged["turns"][-1]["reminders"] = reminders
         merged["turns"][-1]["todo_calls"] = todo_calls
+    merged["token_calibration"] = []
+    for t in traces:
+        merged["token_calibration"].extend(t.get("token_calibration") or [])
     return merged
 
 
@@ -479,6 +482,9 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
         or [read_trace(repo / TRACE_NAME)]
     ) or read_trace(repo / TRACE_NAME)
     turns = trace.get("turns", [])
+    cals = trace.get("token_calibration") or []
+    est_tok = sum(int(e.get("estimated_tokens") or 0) for e in cals)
+    act_tok = sum(int(e.get("prompt_tokens") or 0) for e in cals)
 
     record = {
         "config": name,
@@ -530,6 +536,10 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
             trace.get("tokens_loop", {}).get("cached_reported", 0)
             + trace.get("tokens_aux", {}).get("cached_reported", 0)
         ),
+        # D5.1:字符/4 相对 API prompt_tokens 的偏差。bias=真实/估算,>1 表示低估。
+        "token_estimated": est_tok,
+        "token_prompt_actual": act_tok,
+        "token_estimate_bias": round(act_tok / est_tok, 3) if est_tok else None,
     }
 
     with _io_lock:

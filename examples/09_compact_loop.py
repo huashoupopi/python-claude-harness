@@ -321,6 +321,7 @@ def load_skill(name: str) -> str:
 
 
 model = os.getenv("MODEL")
+# 单位是字符,非 token;主干 22_trunk.py 已改为 token 语义,此处保留课程原码形态用于溯源对照
 CONTEXT_LIMIT = 500000
 KEEP_RECENT = 3
 PERSIST_THRESHOLD = 30000
