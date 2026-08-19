@@ -947,15 +947,25 @@ def trace_pre_hook(name, args):
     #    但【真实长度必须单独记下】—— 否则下游看到的长度是我自己截出来的产物,
     #    「写了 500 字符」和「写了 3000 字符被我截成 500」是两回事。
     # 🪝 截断可以,但不能让截断后的数据看起来像原始数据。
-    _trace_events.append(
-        {
-            "kind": "tool_call",
-            "tool": name,
-            "args": {k: str(v)[:500] for k, v in (args or {}).items()},
-            "arg_lens": {k: len(str(v)) for k, v in (args or {}).items()},
-            "t": time.time(),
-        }
-    )
+    event = {
+        "kind": "tool_call",
+        "tool": name,
+        "args": {k: str(v)[:500] for k, v in (args or {}).items()},
+        "arg_lens": {k: len(str(v)) for k, v in (args or {}).items()},
+        "t": time.time(),
+    }
+    # skills 计量:次数与完整 SKILL.md 长度。不改 load_skill,只在记录器里量。
+    # token 估算写死字符/4,不新增 tokenizer。
+    if name == "load_skill":
+        skill_name = str((args or {}).get("name", ""))
+        skill = SKILL_REGISTRY.get(skill_name) or {}
+        content = skill.get("content", "")
+        chars = len(content)
+        event["skill_name"] = skill_name
+        event["skill_chars"] = chars
+        event["skill_est_tokens"] = chars // 4
+        event["skill_found"] = bool(skill)
+    _trace_events.append(event)
     return None
 
 
@@ -1002,6 +1012,11 @@ def trace_stop_hook(messages):
     try:
         TRACE_DIR.mkdir(parents=True, exist_ok=True)
         path = TRACE_DIR / f"trace_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.json"
+        skill_loads = [
+            e
+            for e in _trace_events
+            if e.get("kind") == "tool_call" and e.get("tool") == "load_skill"
+        ]
         path.write_text(
             json.dumps(
                 {
@@ -1010,6 +1025,18 @@ def trace_stop_hook(messages):
                     "memory_mode": MEMORY_MODE,
                     "todo_mode": TODO_MODE,
                     "sandbox_mode": SANDBOX_MODE,
+                    "skills": {
+                        "load_count": len(skill_loads),
+                        "loads": [
+                            {
+                                "name": e.get("skill_name"),
+                                "chars": e.get("skill_chars", 0),
+                                "est_tokens": e.get("skill_est_tokens", 0),
+                                "found": e.get("skill_found", False),
+                            }
+                            for e in skill_loads
+                        ],
+                    },
                     "events": _trace_events,
                 },
                 ensure_ascii=False,
@@ -3118,7 +3145,7 @@ def run_connect_mcp(name: str) -> str:
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 【第 10 层】工具注册表 · 工具池组装
-#   ToolEntry 四元组(description/schema/validator/handler)+ builtin() 工厂 + 27 个注册
+#   ToolEntry 四元组(description/schema/validator/handler)+ builtin() 工厂 + 28 个注册
 #   🔑 T17 还清的 schema 债:原来是三元组散着放,重构成 NamedTuple 之后,
 #      内置工具的 validator = Pydantic 类,MCP 工具的 validator = None —— 一张表容下两种来源。
 #   ⚠️ MCP 那边曾有坑:lambda 默认参数可被外部 server 劫持 → 改用闭包工厂。

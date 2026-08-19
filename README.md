@@ -16,6 +16,8 @@ uv run python examples/22_trunk.py "修好失败的测试"
 
 不带参数就进对话模式。目前有 28 个工具（读写文件、跑命令、任务清单、子 agent、跨会话记忆、定时任务、git worktree、MCP 插件等）。
 
+技能是**按需加载**的。`skills/*/SKILL.md` 启动时只扫一遍：system prompt 里只放目录（名字 + 一句话描述），模型需要细节时再调 `load_skill`，拿到**完整 SKILL.md（含 frontmatter）**。这是渐进式披露——目录每轮都在、便宜；正文只在用到时付一次。仓库里现成两个例子：`git-commit`、`python-style`。
+
 ---
 
 ## 这个项目真正在做的事
@@ -99,7 +101,7 @@ uv run python bench/sandbox_demo.py
 uv sync                                        # 装依赖
 cp .env.example .env                           # 填 API key
 uv run python examples/22_trunk.py "你的任务"    # 跑 agent
-uv run pytest -q                               # 100 条测试
+uv run pytest -q                               # 测试
 ```
 
 评测系统（要 Docker）：
@@ -117,7 +119,7 @@ uv run python bench/analyze.py         # 看结果
 ```
 examples/22_trunk.py   agent 主体
 bench/                 评测系统：题库、跑批、分析、轨迹视图
-tests/                 100 条测试
+tests/                 测试
 sandbox/               Docker 沙箱镜像
 ```
 
@@ -134,7 +136,7 @@ sandbox/               Docker 沙箱镜像
 | 5 | hooks · 权限 · 轨迹 | 工具调用前后的拦截点 | 774 |
 | 6 | 状态系统 | 任务、git worktree、定时任务 | 1009 |
 | 7 | 团队协作 | 多 agent 之间的消息与协议 | 1493 |
-| 8 | 工具的参数定义 | 27 个工具的入参 schema | 2085 |
+| 8 | 工具的参数定义 | 28 个工具的入参 schema | 2085 |
 | 9 | 工具的实现 | 沙箱、读写文件、子 agent、MCP | 2248 |
 | 10 | 工具注册表 | 把工具装进池子 | 3090 |
 | 11 | prompt 组装 | 模型每轮到底看到什么 | 3273 |
