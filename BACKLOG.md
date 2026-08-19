@@ -63,7 +63,8 @@
 - [ ] 🟡 子 agent / teammate 的 token 未计入
       （📌 2026-08-16 实测：225 次跑批里 `spawn_subagent`/`spawn_teammate` **零调用**，
       所以当前数据没受影响；等有题目真的用到再说）
-- [ ] 🟢 `reasoning_tokens` / `cached_tokens` 未单独分析
+- [x] ~~🟢 `cached_tokens` 未单独分析~~ ✅ 2026-08-19 补测，见 `STAGE3_NOTES.md` §五之二悬置条款
+- [ ] 🟢 `reasoning_tokens` 未单独分析（stage-2 遗留，本项不因 cached 补测划掉）
 
 ---
 

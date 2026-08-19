@@ -200,7 +200,7 @@ def merge_traces(traces: list[dict]) -> dict:
     merged["model"] = next((t.get("model") for t in traces if t.get("model")), None)
     for key in ("tokens_loop", "tokens_aux"):
         merged[key] = {}
-        for field in ("total", "prompt", "calls"):
+        for field in ("total", "prompt", "calls", "cached", "cached_reported"):
             merged[key][field] = sum(t.get(key, {}).get(field, 0) for t in traces)
     merged["system_prompt_chars"] = max(
         (t.get("system_prompt_chars", 0) for t in traces), default=0
@@ -513,10 +513,22 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
         "tokens_loop": trace.get("tokens_loop", {}).get("total", 0),
         "tokens_loop_prompt": trace.get("tokens_loop", {}).get("prompt", 0),
         "tokens_aux": trace.get("tokens_aux", {}).get("total", 0),
+        "tokens_aux_prompt": trace.get("tokens_aux", {}).get("prompt", 0),
         "aux_calls": trace.get("tokens_aux", {}).get("calls", 0),
         "tokens_total": (
             trace.get("tokens_loop", {}).get("total", 0)
             + trace.get("tokens_aux", {}).get("total", 0)
+        ),
+        # cached_tokens:为 08-16「动态工具子集不做」原判补测全量前缀的缓存收益
+        "tokens_loop_cached": trace.get("tokens_loop", {}).get("cached", 0),
+        "tokens_aux_cached": trace.get("tokens_aux", {}).get("cached", 0),
+        "tokens_cached": (
+            trace.get("tokens_loop", {}).get("cached", 0)
+            + trace.get("tokens_aux", {}).get("cached", 0)
+        ),
+        "cached_reported": (
+            trace.get("tokens_loop", {}).get("cached_reported", 0)
+            + trace.get("tokens_aux", {}).get("cached_reported", 0)
         ),
     }
 
@@ -619,7 +631,9 @@ for name in CONFIGS:
         f"催 {avg('reminders'):.1f} 次 → todo {avg('todo_calls'):.1f} 次   "
         f"token {avg('tokens_total') / 1000:.1f}k"
         f"(主 {avg('tokens_loop') / 1000:.1f}k + 附加层 {avg('tokens_aux') / 1000:.1f}k"
-        f"/{avg('aux_calls'):.1f} 次调用)"
+        f"/{avg('aux_calls'):.1f} 次调用) "
+        f"cached {avg('tokens_cached'):.0f}"
+        f"/{avg('tokens_loop_prompt') + avg('tokens_aux_prompt'):.0f} prompt"
     )
 
 bad = [r for r in results if r["tests_tampered"]]

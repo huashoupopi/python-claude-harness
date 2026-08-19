@@ -190,7 +190,37 @@ if TODO_MODE not in TODO_MODES:
 #    它丢的是整个 msg。去掉①之后这层保护也没了,所以②里必须显式
 #    build_message(text, {}) 把可能残缺的 tool_calls 丢掉,否则孤儿 → API 400。
 DEFAULT_MAX_TOKENS = 8000
-TOKEN_USAGE = {"prompt": 0, "completion": 0, "total": 0}
+# cached = prompt_tokens_details.cached_tokens 累加
+# cached_reported = 多少次 usage 带回了 prompt_tokens_details(有字段但值为 0 也算)
+# 两者分开:全 0 时要能分清「端点没给这个字段」和「给了但没命中」
+TOKEN_USAGE = {
+    "prompt": 0,
+    "completion": 0,
+    "total": 0,
+    "cached": 0,
+    "cached_reported": 0,
+}
+
+
+def _usage_cached_tokens(usage) -> int:
+    """从流式/非流式 usage 取出 cached_tokens。字段缺失当 0,不编。"""
+    if usage is None:
+        return 0
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details is None:
+        return 0
+    if isinstance(details, dict):
+        val = details.get("cached_tokens")
+    else:
+        val = getattr(details, "cached_tokens", None)
+    return int(val or 0)
+
+
+def _usage_cached_field_present(usage) -> bool:
+    """这次 usage 有没有带回 prompt_tokens_details。"""
+    if usage is None:
+        return False
+    return getattr(usage, "prompt_tokens_details", None) is not None
 MAX_RECOVERY_RETRIES = 3
 MAX_RETRIES = 10
 BASE_DELAY_MS = 500
@@ -3676,6 +3706,9 @@ def agent_loop(messages: list, context: dict):
                 TOKEN_USAGE["prompt"] += usage.prompt_tokens
                 TOKEN_USAGE["completion"] += usage.completion_tokens
                 TOKEN_USAGE["total"] += usage.total_tokens
+                TOKEN_USAGE["cached"] += _usage_cached_tokens(usage)
+                if _usage_cached_field_present(usage):
+                    TOKEN_USAGE["cached_reported"] += 1
             reactive_retries = 0
         except Exception as e:
             # 🔴 2026-08-15 修:原来这里是手写的两个关键词判断

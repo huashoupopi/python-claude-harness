@@ -75,7 +75,9 @@ _trace = {
 #     summarize_history                                                    → compact 层
 # 不记的话,self 臂比 none 臂多花的钱一分都看不见 —— memory 轴的成本差异是假的。
 # calls 这个数本身就有价值:它直接量化「这一层额外调了几次 LLM」。
-_aux = {"prompt": 0, "completion": 0, "total": 0, "calls": 0}
+_aux = {"prompt": 0, "completion": 0, "total": 0, "calls": 0, "cached": 0, "cached_reported": 0}
+_cached_of = getattr(m, "_usage_cached_tokens", lambda u: 0)
+_cached_seen = getattr(m, "_usage_cached_field_present", lambda u: False)
 
 
 def _spy_create(**kwargs):
@@ -89,6 +91,9 @@ def _spy_create(**kwargs):
             _aux["prompt"] += u.prompt_tokens
             _aux["completion"] += u.completion_tokens
             _aux["total"] += u.total_tokens
+            _aux["cached"] += _cached_of(u)
+            if _cached_seen(u):
+                _aux["cached_reported"] += 1
         _aux["calls"] += 1
         return resp
 

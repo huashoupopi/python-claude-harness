@@ -349,12 +349,20 @@ def test_parallel_tool_calls_out_of_order(trunk):
     assert msg == expected_msg
 
 
-def make_usage_chunk(prompt=10, completion=2):
+def make_usage_chunk(prompt=10, completion=2, cached=None):
     """造一片【只有 usage、没有 choices】的 chunk。
 
     这是 stream_options={"include_usage": True} 时真实会来的最后一片。
     make_chunk 造不出它 —— 那个函数固定塞一个 choice 进去。
+    cached is not None 时带上 prompt_tokens_details.cached_tokens。
     """
+    usage = {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+    }
+    if cached is not None:
+        usage["prompt_tokens_details"] = {"cached_tokens": cached}
     return ChatCompletionChunk.model_validate(
         {
             "id": "chatcmpl-fake",
@@ -362,11 +370,7 @@ def make_usage_chunk(prompt=10, completion=2):
             "created": 0,
             "model": "fake-model",
             "choices": [],  # ← 空!
-            "usage": {
-                "prompt_tokens": prompt,
-                "completion_tokens": completion,
-                "total_tokens": prompt + completion,
-            },
+            "usage": usage,
         }
     )
 
@@ -407,3 +411,39 @@ def test_no_usage_when_not_requested(trunk):
     chunks = [make_chunk(content="hi"), make_chunk(finish_reason="stop")]
     _text, _tc, _reason, usage = trunk.accumulate_stream(chunks)
     assert usage is None
+
+
+def test_usage_chunk_exposes_cached_tokens(trunk):
+    """usage 片带 prompt_tokens_details.cached_tokens 时,探针必须读得到。"""
+    chunks = [
+        make_chunk(content="hi"),
+        make_chunk(finish_reason="stop"),
+        make_usage_chunk(prompt=100, completion=5, cached=80),
+    ]
+    _text, _tc, _reason, usage = trunk.accumulate_stream(chunks)
+    assert trunk._usage_cached_tokens(usage) == 80
+    assert trunk._usage_cached_field_present(usage) is True
+
+
+def test_usage_chunk_without_cached_details_is_zero_not_crash(trunk):
+    """端点不给 prompt_tokens_details 时,cached 记 0,字段标记为未出现。"""
+    chunks = [
+        make_chunk(content="hi"),
+        make_chunk(finish_reason="stop"),
+        make_usage_chunk(prompt=10, completion=2),
+    ]
+    _text, _tc, _reason, usage = trunk.accumulate_stream(chunks)
+    assert usage is not None
+    assert trunk._usage_cached_tokens(usage) == 0
+    assert trunk._usage_cached_field_present(usage) is False
+
+
+def test_usage_cached_helpers_on_none_and_zero(trunk):
+    """usage 缺失 / cached=0 都不能炸,也不能把 0 当成「没这个字段」。"""
+    assert trunk._usage_cached_tokens(None) == 0
+    assert trunk._usage_cached_field_present(None) is False
+
+    chunk = make_usage_chunk(prompt=50, completion=1, cached=0)
+    usage = chunk.usage
+    assert trunk._usage_cached_tokens(usage) == 0
+    assert trunk._usage_cached_field_present(usage) is True

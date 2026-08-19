@@ -346,6 +346,52 @@ T19 综合验收在**弱基座**（`deepseek-v4-flash`）上实测到 27 个工�
 （混入土耳其语/俄语、泄漏 `</think>`）。本批在 `composer-2.5-fast` 上 225/225 全过，
 无任何退化迹象。→ **「给全部工具」这个结论与基座强弱有关，换弱模型需重新判断。**
 
+### 悬置条款：cached_tokens 补测（2026-08-19）
+
+**为维持 2026-08-16 原判补充证据。** 本测只回答「全量稳定工具前缀存在多少缓存收益」。
+没有跑过子集臂，**不得**据此声称「定量证明动态工具子集是负收益」。
+
+口径：`cached` = API `usage.prompt_tokens_details.cached_tokens` 累加；
+命中率 = `cached / prompt`（主循环 + 附加层合计）。字段缺失记 0，不估算。
+`cached_reported` = 带回了 `prompt_tokens_details` 的 usage 次数（有字段但值为 0 也算）。
+
+```
+样本量     10 单元 = mem_self × t01–t05 × 2 trial
+模型       grok-composer-2.5-fast
+跑批目录   bench/runs/run_20260819_194107
+成绩       10/10 PASSED，平均 9.4 步，103s
+```
+
+逐单元（results.jsonl 原文汇总）：
+
+```
+task                    trial  turns  prompt  cached  reported  hit%
+t03_cross_file            1      5    19068    7936      6     41.6
+t02_create_file           1      6    23782    8832      7     37.1
+t01_fix_failing_test      1      6    24458   11008      7     45.0
+t04_multi_bug             1      6    26115   18944      7     72.5
+t01_fix_failing_test      2      5    21081   11520      6     54.6
+t05_thread_param          1      6    24945   14848      7     59.5
+t02_create_file           2      6    23923   14720      7     61.5
+t03_cross_file            2      5    19881   13312      6     67.0
+t05_thread_param          2      6    24706    9344      7     37.8
+t04_multi_bug             2      6    25822   17280      7     66.9
+────────────────────────────────────────────────────────────────
+合计                              233781  127744     67     54.64
+  其中 loop  prompt=224310 cached=123904
+       aux   prompt=  9471 cached=  3840
+```
+
+67 次 usage **全部**带回了 `prompt_tokens_details`（10 单元 × (turns+1 次附加层调用) 对得上），
+所以 54.64% 是「字段在、命中是这个数」，不是「端点没给这个字段所以记了 0」。
+单元命中率 37.1%–72.5%，宏观均值 54.37%。
+
+这批数字能说的：在本端点、本模型、全量工具前缀保持稳定时，**prompt cache 有实测命中**。
+这批数字不能说的：裁剪工具子集之后命中率会怎样——没跑过那一臂。
+
+stage-2 笔记里那条「单次 502 prompt / 384 cached = 76%」是另一模型、另一次调用，
+与本批 10 单元合计不可比，不拿来加权。
+
 ---
 
 ## 六、待办
@@ -358,5 +404,5 @@ T19 综合验收在**弱基座**（`deepseek-v4-flash`）上实测到 27 个工�
 - 🟡 **幻觉螺旋的专项题**：t08 那次 48 个虚构文件是本项目见过最贵的失败模式，
   而它只被采样到一次。值得设计一道专门诱发它的题，把尾部行为变成可观测的。
 - 🟡 **子 agent / teammate 的 token 未计入**（stage-2 遗留，仍未清）。
-- 🟢 `reasoning_tokens` 与 `cached_tokens` 未单独分析（stage-2 遗留，76% 缓存命中率
-  关系到「压缩与 prompt cache 是天敌」这个判断）。
+- ~~🟢 `cached_tokens` 未单独分析~~ ✅ 2026-08-19 补测，见 §五之二悬置条款（只关这一条）
+- 🟢 `reasoning_tokens` 未单独分析（stage-2 遗留，保持挂账）
