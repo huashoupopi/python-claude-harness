@@ -313,3 +313,184 @@ def test_teammate_truncation_keeps_pairs(trunk):
             break
     calls, results = collect_pairs([msgs[0]] + msgs[max(cut, 1) :])
     assert results <= calls, f"还有孤儿: {results - calls}"
+
+
+# ---------------------------------------------------------------------------
+# 包 D:L4 阈值单位 + 受控触发 + compact trace + REPL /compact
+# ---------------------------------------------------------------------------
+
+
+def test_estimate_size_is_chars_divided_by_four(trunk):
+    """estimate_size 与 CONTEXT_LIMIT 必须同一单位(token=字符/4)。只改一边会让 L4 更难触发。"""
+    msgs = [{"role": "user", "content": "abcd" * 250}]
+    chars = len(str(msgs))
+    assert trunk.estimate_size(msgs) == chars // 4
+    assert trunk.CONTEXT_LIMIT == int(
+        trunk.MODEL_CONTEXT_TOKENS * trunk.COMPACT_TRIGGER_RATIO
+    )
+
+
+def test_l1_l2_l3_thresholds_untouched(trunk):
+    """本包只动 L4 门槛来源,L1/L2/L3 的既有阈值不许改。"""
+    import inspect
+
+    assert trunk.KEEP_RECENT == 3
+    assert trunk.PERSIST_THRESHOLD == 30000
+    assert "max_msgs=50" in inspect.getsource(trunk.snip_compact)
+    assert "max_bytes=200_000" in inspect.getsource(trunk.tool_result_budget)
+    assert "persist" not in inspect.getsource(trunk.micro_compact)
+
+
+def test_default_limit_does_not_compact_small_history(trunk):
+    """默认窗口×0.8 下,短对话不该走 L4。"""
+    msgs = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "hi"},
+    ]
+    before = [dict(m) for m in msgs]
+    trunk.try_compact(msgs)
+    assert msgs == before
+
+
+def test_lowered_token_limit_triggers_l4(sandbox, monkeypatch):
+    """MODEL_CONTEXT_TOKENS=2000 同款:CONTEXT_LIMIT=1600 token 时,纯长文本必须触发 L4。"""
+    monkeypatch.setattr(sandbox, "CONTEXT_LIMIT", 1600)
+    monkeypatch.setattr(sandbox, "compact_failures", 0)
+    called = []
+
+    def fake_hist(msgs):
+        called.append(len(msgs))
+        return [{"role": "user", "content": "[Compacted]\n\nstub-summary"}]
+
+    monkeypatch.setattr(sandbox, "compact_history", fake_hist)
+    msgs = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "x" * 8000},
+    ]
+    assert sandbox.estimate_size(msgs) > 1600
+    sandbox.try_compact(msgs)
+    assert called, "调低阈值后 L4 没出手"
+    assert msgs[0]["role"] == "system"
+    assert msgs[1]["content"].startswith("[Compacted]")
+    assert len(msgs) == 2
+
+
+def test_compact_trace_keeps_chars_and_tokens(sandbox, tmp_path, monkeypatch):
+    """出手时记 compact 事件,字符和 token 两个口径都要在。"""
+    monkeypatch.setattr(sandbox, "TRACE_MODE", "on")
+    monkeypatch.setattr(sandbox, "TRACE_DIR", tmp_path / ".traces")
+    monkeypatch.setattr(sandbox, "_trace_events", [])
+    monkeypatch.setattr(sandbox, "CONTEXT_LIMIT", 1600)
+    monkeypatch.setattr(sandbox, "compact_failures", 0)
+    monkeypatch.setattr(
+        sandbox,
+        "compact_history",
+        lambda msgs: [{"role": "user", "content": "[Compacted]\n\nstub"}],
+    )
+    msgs = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "y" * 8000},
+    ]
+    chars_before = sandbox._chars_of(msgs)
+    sandbox.try_compact(msgs)
+    events = [e for e in sandbox._trace_events if e.get("kind") == "compact"]
+    assert events, "L4 出手了但 trace 没有 compact 事件"
+    ev = events[-1]
+    assert ev["layer"] == "L4"
+    assert ev["reason"] == "over_limit"
+    assert ev["chars_before"] == chars_before
+    assert ev["tokens_before"] == chars_before // 4
+    assert "chars_after" in ev and "tokens_after" in ev
+    assert ev["n_after"] == 2
+
+
+def test_repl_compact_force_rewrites_history(sandbox, monkeypatch):
+    """/compact 走 try_compact(force=True),不看门槛。"""
+    monkeypatch.setattr(sandbox, "compact_failures", 0)
+    monkeypatch.setattr(
+        sandbox,
+        "compact_history",
+        lambda msgs: [{"role": "user", "content": "[Compacted]\n\nforced"}],
+    )
+    history = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "short"},
+    ]
+    assert sandbox.estimate_size(history) <= sandbox.CONTEXT_LIMIT
+    consumed = sandbox.handle_repl_command("/compact", history)
+    assert consumed is True
+    assert history[1]["content"].startswith("[Compacted]")
+    assert sandbox.handle_repl_command("普通问题", history) is False
+
+
+def test_l2_snip_emits_compact_event_in_agent_loop(sandbox, monkeypatch):
+    """L2 出手(抹旧 tool 结果)要进 trace;L1/L3 没出手就不要冒充。"""
+    monkeypatch.setattr(sandbox, "TRACE_MODE", "on")
+    monkeypatch.setattr(sandbox, "_trace_events", [])
+    monkeypatch.setattr(sandbox, "MEMORY_MODE", "none")
+    monkeypatch.setattr(sandbox, "TODO_MODE", "none")
+    monkeypatch.setattr(sandbox, "compact_failures", 0)
+
+    rounds = {"n": 0}
+
+    def fake_create(**kwargs):
+        rounds["n"] += 1
+        if rounds["n"] == 1:
+            return iter([_text_chunk("done")])
+        return iter([_text_chunk("done")])
+
+    monkeypatch.setattr(sandbox.client.chat.completions, "create", fake_create)
+    msgs = build_history(6)  # 14 条,旧结果会被 L2 抹掉
+    sandbox.agent_loop(msgs, {})
+    layers = [
+        e["layer"] for e in sandbox._trace_events if e.get("kind") == "compact"
+    ]
+    assert "L2" in layers
+    assert "L1" not in layers  # 14 条 < 50,L1 不应出手
+    assert "L3" not in layers  # 合计远低于 200_000,L3 不应出手
+
+
+def test_trace_view_shows_compact_event(tmp_path, capsys, monkeypatch):
+    """彩色视图必须把 compact 事件画出来,不能当成缺 tool 名的调用崩掉。"""
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "trace_view_under_test",
+        Path(__file__).parent.parent / "bench" / "trace_view.py",
+    )
+    tv = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tv)
+    payload = {
+        "harness": "test",
+        "model": "fake",
+        "memory_mode": "none",
+        "todo_mode": "nudge",
+        "sandbox_mode": "off",
+        "events": [
+            {"kind": "user", "text": "hi", "t": 1.0},
+            {
+                "kind": "compact",
+                "layer": "L4",
+                "reason": "over_limit",
+                "chars_before": 8000,
+                "chars_after": 200,
+                "tokens_before": 2000,
+                "tokens_after": 50,
+                "n_before": 40,
+                "n_after": 2,
+                "t": 2.0,
+            },
+        ],
+    }
+    import json
+
+    path = tmp_path / "trace_compact.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["trace_view.py", str(path)])
+    tv.main()
+    out = capsys.readouterr().out
+    assert "L4" in out
+    assert "8000→200" in out
+    assert "2000→50" in out

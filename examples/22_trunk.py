@@ -73,7 +73,11 @@ model = os.getenv("MODEL")
 
 CURRENT_TODOS: list = []
 MAX_GLOB_RESULTS = 200
-CONTEXT_LIMIT = 500000
+# L4 门槛单位是 token。窗口×比例,不是写死的字符数。
+# 比例留给本轮输出和下轮输入;压满再压只会撞 API 400,那就只能走 reactive。
+MODEL_CONTEXT_TOKENS = int(os.getenv("MODEL_CONTEXT_TOKENS", "131072"))
+COMPACT_TRIGGER_RATIO = float(os.getenv("COMPACT_TRIGGER_RATIO", "0.8"))
+CONTEXT_LIMIT = int(MODEL_CONTEXT_TOKENS * COMPACT_TRIGGER_RATIO)
 KEEP_RECENT = 3
 PERSIST_THRESHOLD = 30000
 MEMORY_TYPES = ["user", "feedback", "project", "reference"]
@@ -3657,9 +3661,45 @@ MAX_COMPACT_RETRIES = 3  # retry limit for compact_history
 compact_failures = 0
 
 
+def _chars_of(msgs) -> int:
+    return len(str(msgs))
+
+
+def estimate_size(msgs) -> int:
+    """token 估算 = 字符数 / 4。不引入 tokenizer。"""
+    return _chars_of(msgs) // 4
+
+
+def _record_compact_event(layer, reason, chars_before, n_before, msgs):
+    """压缩层出手才记。trace 同时留字符和 token 两个口径。"""
+    if TRACE_MODE != "on":
+        return
+    chars_after = _chars_of(msgs)
+    n_after = len(msgs)
+    if chars_after == chars_before and n_after == n_before:
+        return
+    _trace_events.append(
+        {
+            "kind": "compact",
+            "layer": layer,
+            "reason": reason,
+            "chars_before": chars_before,
+            "chars_after": chars_after,
+            "tokens_before": chars_before // 4,
+            "tokens_after": chars_after // 4,
+            "n_before": n_before,
+            "n_after": n_after,
+            "t": time.time(),
+        }
+    )
+
+
 def try_compact(msgs, force=False):
     global compact_failures
-    if estimate_size(msgs) > CONTEXT_LIMIT or force:
+    chars_before = _chars_of(msgs)
+    n_before = len(msgs)
+    tokens = chars_before // 4
+    if tokens > CONTEXT_LIMIT or force:
         if compact_failures < MAX_COMPACT_RETRIES:
             print("[auto-compact]")
             assert msgs[0]["role"] == "system", "First message must be system prompt"
@@ -3670,11 +3710,9 @@ def try_compact(msgs, force=False):
                 compact_failures += 1
             else:
                 compact_failures = 0
+                reason = "force" if force else "over_limit"
+                _record_compact_event("L4", reason, chars_before, n_before, msgs)
     return msgs
-
-
-def estimate_size(msgs):
-    return len(str(msgs))
 
 
 def agent_loop(messages: list, context: dict):
@@ -3697,9 +3735,15 @@ def agent_loop(messages: list, context: dict):
     state = RecoveryState()
     for turn in range(max_turns):
         pre_compress = [dict(m) for m in messages]
+        cb, nb = _chars_of(messages), len(messages)
         messages[:] = tool_result_budget(messages)  # L3: persist large results first
+        _record_compact_event("L3", "tool_result_budget", cb, nb, messages)
+        cb, nb = _chars_of(messages), len(messages)
         messages[:] = snip_compact(messages)  # L1: trim middle
+        _record_compact_event("L1", "max_msgs", cb, nb, messages)
+        cb, nb = _chars_of(messages), len(messages)
         messages[:] = micro_compact(messages)  # L2: old result placeholders
+        _record_compact_event("L2", "old_tool_results", cb, nb, messages)
         try_compact(messages)  # L4: summarize if too large
         if TODO_MODE == "nudge" and rounds_since_todo >= 3 and messages:
             messages.append(
@@ -3753,7 +3797,9 @@ def agent_loop(messages: list, context: dict):
                 assert messages[0]["role"] == "system", (
                     "First message must be system prompt"
                 )
+                cb, nb = _chars_of(messages), len(messages)
                 messages[1:] = reactive_compact(messages)
+                _record_compact_event("reactive", "prompt_too_long", cb, nb, messages)
                 reactive_retries += 1
                 continue
             messages.append(
@@ -3896,6 +3942,21 @@ def print_latest_assistant_text(messages: list):
         print(f"[assistant] {content}")
 
 
+def handle_repl_command(line: str, history: list) -> bool:
+    """REPL 斜杠命令。True = 已消费,不要交给 agent。"""
+    if line.strip() != "/compact":
+        return False
+    if not history or history[0].get("role") != "system":
+        print("  [compact] 没有可压缩的历史")
+        return True
+    n0, c0 = len(history), _chars_of(history)
+    try_compact(history, force=True)
+    print(
+        f"  [compact] {n0} 条/{c0} 字符 → {len(history)} 条/{_chars_of(history)} 字符"
+    )
+    return True
+
+
 def run_agent_turn_locked(user_query: str | None = None, cron: bool = False):
     global session_context
     global _memories_cache
@@ -3989,6 +4050,8 @@ def main():
             if user_input.strip().lower() in ["q", "quit", "exit"]:
                 break
             with agent_lock:
+                if handle_repl_command(user_input, session_history):
+                    continue
                 run_agent_turn_locked(user_input)
     finally:
         stop_sandbox()  # SANDBOX_MODE=off 时 _sandbox_name 是 None,这里直接返回,无害

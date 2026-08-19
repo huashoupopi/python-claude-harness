@@ -24,6 +24,7 @@ wheels/
 # 记忆系统 / 轨迹归档 / 后台任务输出
 .memory/
 .transcripts/
+.traces/
 .task_outputs/
 # mini-bench 的历次跑分结果(题库 bench/tasks/ 要进仓,成绩单不进)
 bench/runs/

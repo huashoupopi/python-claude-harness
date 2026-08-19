@@ -226,6 +226,15 @@ def main():
         if r.get("kind") == "user":
             print(f"  {paint('USER ', 'bold')} {r['text'][:limit]}\n")
             continue
+        if r.get("kind") == "compact":
+            print(
+                f"  {paint('CMP ', 'magenta')} {paint(str(r.get('layer')), 'cyan')}  "
+                f"{r.get('chars_before')}→{r.get('chars_after')} 字  "
+                f"{r.get('tokens_before')}→{r.get('tokens_after')} tok  "
+                f"n={r.get('n_before')}→{r.get('n_after')}  "
+                f"{paint(str(r.get('reason')), 'dim')}"
+            )
+            continue
         if r.get("kind") == "think":
             # 思考时间只在【值得注意】时才占一行 —— 每一步都印会把工具淹掉
             if r["ms"] >= 1000:
