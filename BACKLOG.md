@@ -92,5 +92,5 @@
 ## 已知的债
 
 - [x] ~~`harness/` 是死包，`main.py` 还在 import 它~~ 已删；`main.py` 只转发 `examples/22_trunk.py`
-- [ ] 两份黑名单（`DENY_LIST` 与 `run_bash` 里的 `dangerous`）
+- [x] ~~两份黑名单（`DENY_LIST` 与 `run_bash` 里的 `dangerous`）~~ F2 已并成 `DENY_LIST` 一处，对照见 `docs/2026-08-20_F2黑名单对照.md`
 - [ ] `teammate` 那条线仍是非流式（主 agent 已流式，行为不一致）

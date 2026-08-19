@@ -859,6 +859,7 @@ DENY_LIST = [
     "mkfs",
     "dd if=",
     "> /dev/sda",
+    "> /dev/",
 ]
 DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
 
@@ -2370,8 +2371,7 @@ def stop_sandbox():
 def run_bash(
     command: str, run_in_background: bool = False, cwd: Path | None = None
 ) -> str:
-    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-    if any(d in command for d in dangerous):
+    if any(d in command for d in DENY_LIST):
         return "Error: dangerous command blocked"
     try:
         if SANDBOX_MODE == "docker":

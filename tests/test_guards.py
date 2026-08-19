@@ -8,6 +8,8 @@
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 TRUNK_PATH = Path(__file__).parent.parent / "examples" / "22_trunk.py"
 
 
@@ -209,6 +211,37 @@ def test_worktree_errors_share_one_format(sandbox):
     ]
     for o in outs:
         assert o.startswith("Error: "), f"格式不一致: {o!r}"
+
+
+# ---------- F2:DENY_LIST 与 run_bash 共用并集 ----------
+
+# 合并前两份各自有的模式。合并后任一口径都必须仍拦住。
+_FORMER_DENY = [
+    "rm -rf /",
+    "sudo",
+    "shutdown",
+    "reboot",
+    "mkfs",
+    "dd if=",
+    "> /dev/sda",
+]
+_FORMER_DANGEROUS = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
+
+
+@pytest.mark.parametrize("pattern", _FORMER_DENY + ["> /dev/"])
+def test_union_still_blocked_by_permission_hook(trunk, pattern):
+    cmd = f"echo x {pattern} y" if pattern.startswith(">") else pattern + " something"
+    blocked = trunk.permission_hook("bash", {"command": cmd})
+    assert blocked is not None, f"hook 没拦住原 DENY/dangerous 模式: {pattern!r}"
+
+
+@pytest.mark.parametrize("pattern", _FORMER_DANGEROUS + ["mkfs", "dd if=", "> /dev/sda"])
+def test_union_still_blocked_by_run_bash(sandbox, tmp_path, monkeypatch, pattern):
+    monkeypatch.setattr(sandbox, "WORKDIR", tmp_path)
+    monkeypatch.setattr(sandbox, "SANDBOX_MODE", "off")
+    cmd = f"echo x {pattern} y" if pattern.startswith(">") else f"{pattern} /tmp/x"
+    out = sandbox.run_bash(cmd)
+    assert "dangerous command blocked" in out, f"run_bash 没拦住: {pattern!r} -> {out!r}"
 
 
 # ---------- 轨迹记录(T23 可观测性) ----------
