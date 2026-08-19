@@ -30,7 +30,7 @@ url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 default = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["harness"]
+only-include = ["main.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

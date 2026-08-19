@@ -5,11 +5,7 @@
     ⑵ examples/ 下是按课程 01-22 编号的学习序列,22 是九件共存的最终形态,
        这个编号本身是叙事的一部分,不想为了「能 import」去改名。
 
-⚠️ 历史遗留:本文件此前 import 的是 harness/ 那个包 —— 那是课程早期的半成品
-   (686 行,只有 loop/tools/hooks/permissions 四件),而真正在跑、被 100 条测试和
-   整套 bench 覆盖的是 examples/22_trunk.py(约 3900 行,27 个工具)。
-   于是 clone 下来的人跑 `python main.py`,跑起来的是个残废版本。
-   harness/ 暂时留着(pyproject 的打包配置指着它),清理记在 BACKLOG.md。
+真正在跑、被测试和 bench 覆盖的是 examples/22_trunk.py。
 """
 
 import runpy

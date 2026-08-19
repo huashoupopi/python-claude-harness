@@ -27,7 +27,7 @@
 - [ ] **bench 三个脚本**：`agent_runner.py`（`TARGET = "22_trunk.py"`）、`run_bench.py`、`sandbox_demo.py`
 - [ ] ⚠️ **溯源**：`STAGE2/STAGE3_NOTES` 全部标注「被测 = 22_trunk.py」，225 单元的数据挂在这个名字上
 - [ ] ⚠️ **基准关系**：`21_mcp_real.py` 是课程原状基准，22 是它的「可 import 副本」，拆包会切断这层对照
-- [ ] `harness/` 死包（686 行）正好是拆包的目的地，但 `pyproject.toml` 的打包配置指着它，动之前先看
+- [x] ~~`harness/` 死包~~ 已删（F1）。拆包最早 08-25，不要把死包当目的地再用。
 
 ---
 
@@ -91,6 +91,6 @@
 
 ## 已知的债
 
-- [ ] `harness/` 是**死包**，`main.py` 还在 import 它 —— 真正在跑的是 `examples/22_trunk.py`
+- [x] ~~`harness/` 是死包，`main.py` 还在 import 它~~ 已删；`main.py` 只转发 `examples/22_trunk.py`
 - [ ] 两份黑名单（`DENY_LIST` 与 `run_bash` 里的 `dangerous`）
 - [ ] `teammate` 那条线仍是非流式（主 agent 已流式，行为不一致）

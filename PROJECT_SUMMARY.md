@@ -21,8 +21,7 @@ The `python-claude-harness` project is a specialized learning repository designe
   - `python-dotenv`: For environment variable management.
 
 ## Planned Architecture
-- `harness/core/`: Implementation of the agent loop, provider adapters, and context logic.
-- `harness/tools/`: Tool definitions for the agent.
+- `examples/22_trunk.py`: 真正在跑的主干（单文件，13 层）。
 - `notes/`: Learning reflections per chapter.
 - `comparisons/`: Benchmarking against Aider and the original Claude Code.
 
