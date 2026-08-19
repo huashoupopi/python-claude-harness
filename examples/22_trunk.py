@@ -1961,19 +1961,24 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                             break
                     messages = [messages[0]] + messages[max(cut, 1) :]
                 try:
-                    response = client.chat.completions.create(
+                    # 与主循环 / subagent 同一条流式路径,避免同一套 harness 两种行为。
+                    stream = client.chat.completions.create(
                         model=model,
                         messages=messages,  # 第一条要保留
                         tools=sub_tools,
                         tool_choice="auto",
+                        stream=True,
                         max_tokens=8000,
+                        stream_options={"include_usage": True},
                     )
+                    text, tool_calls, _finish, usage = accumulate_stream(stream)
+                    _record_token_calibration(messages, usage)
                 except Exception as e:
                     print(f"  \033[31m[teammate] {name} error: {e}\033[0m")
                     break
-                msg = response.choices[0].message
-                messages.append(msg.model_dump(exclude_none=True))
-                if not msg.tool_calls:
+                messages.append(build_message(text, tool_calls))
+                calls = [tc for _, tc in sorted(tool_calls.items())]
+                if not calls:
                     break
                     # # Idle: wait for inbox messages instead of exiting
                     # # Real CC sends idle_notification to Lead here
@@ -2004,7 +2009,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                     #             }
                     #         )
                     #         break  # back to LLM turn with new messages
-                for tc in msg.tool_calls:
+                for tc in calls:
                     entry = sub_tool_registry.get(tc.function.name)
                     if not entry:
                         output = f"Error: unknown tool '{tc.function.name}'"
