@@ -50,14 +50,16 @@ TYPES = {
     ],
 }
 
+failures = []
 for pkg, patterns in TYPES.items():
     lines = [ln for ln in text.splitlines() if ln.startswith(pkg + ":")]
-    assert lines, f"missing line for {pkg}"
+    if not lines:
+        failures.append(f"missing line for {pkg}")
+        continue
     blob = " ".join(lines)
     if not any(re.search(p, blob, flags=re.IGNORECASE) for p in patterns):
-        raise AssertionError(
-            f"{pkg} line does not mention the violation type {patterns}: {lines[0]}"
-        )
+        failures.append(f"{pkg} line does not mention the violation type: {lines[0]}")
+assert not failures, "; ".join(failures)
 print("audit ok")
 print("1 passed in 0.00s")
 PY

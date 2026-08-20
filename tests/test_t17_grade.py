@@ -86,3 +86,45 @@ def test_no_audit_file_fails():
             ["bash", str(GRADE), td], capture_output=True, text=True, timeout=30
         )
     assert r.returncode != 0
+
+
+def test_fourway_nonsense_all_six_fail():
+    """四头验①：六行废话，六条都该挂（判别力还在，不是放宽过头）。"""
+    r = _grade(
+        "pkg_alpha: 今天天气不错\n"
+        "pkg_beta: lorem ipsum\n"
+        "pkg_gamma: hello world\n"
+        "pkg_delta: 无事发生\n"
+        "pkg_epsilon: n/a\n"
+        "pkg_zeta: ok\n"
+    )
+    assert r.returncode != 0
+    err = r.stdout + r.stderr
+    for pkg in (
+        "pkg_alpha",
+        "pkg_beta",
+        "pkg_gamma",
+        "pkg_delta",
+        "pkg_epsilon",
+        "pkg_zeta",
+    ):
+        assert pkg in err, f"{pkg} 废话行居然过了: {err}"
+
+
+def test_fourway_swap_alpha_beta_only_those_fail():
+    """四头验④：把 alpha/beta 两行互换，只有这两条挂，其余仍过。"""
+    swapped = (
+        "pkg_alpha: 可变对象 list 作为函数默认参数\n"
+        "pkg_beta: 使用 eval 执行表达式字符串\n"
+        "pkg_gamma: 用 is 比较字符串内容\n"
+        "pkg_delta: 用 == 比较浮点计算结果\n"
+        "pkg_epsilon: 使用裸 except:\n"
+        "pkg_zeta: 用 items or [] 对假值不友好的默认\n"
+    )
+    r = _grade(swapped)
+    assert r.returncode != 0
+    err = r.stdout + r.stderr
+    assert "pkg_alpha" in err
+    assert "pkg_beta" in err
+    for pkg in ("pkg_gamma", "pkg_delta", "pkg_epsilon", "pkg_zeta"):
+        assert pkg not in err, f"互换不该连累 {pkg}: {err}"
