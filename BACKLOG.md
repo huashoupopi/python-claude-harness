@@ -20,10 +20,23 @@
 **拆的时候就按那 13 段切**——分层已经是连续的，因为 T19 本来就是按课程顺序搬进来的。
 
 **真正的难点（不是"分不清哪个函数属于哪层"，那个已经解决了）**：
-- [ ] **循环依赖**：`execute_tool` 要调所有 handler → handler 要用 hooks → hooks 要用 trace。
-      单文件时共享一个命名空间，拆开必须先定依赖方向（大概率要一个 `registry` 或 `context` 居中）
-- [ ] **模块级状态**：`_trace_events` / `_hooks` / `registry` / `session_context` 拆开后归谁
-- [ ] **`tests/conftest.py`** 现在用 `importlib` 按路径装单文件，100 条测试全挂在这个 fixture 上
+- [x] ~~**循环依赖**：`execute_tool` 要调所有 handler → handler 要用 hooks → hooks 要用 trace~~
+      ⛔ **2026-08-20 探针实测推翻：这条链在代码里不成立。**
+      `execute_tool`（:3487-3518）内**零处** `trigger_hook`；hooks 实际在 `agent_loop`(:3930/:3959)
+      与 `spawn_subagent`(:2754/:2766)。**函数级 SCC = 0。**
+      真正的环是另外两条（按 13 层切文件后才出现）：
+      ⑴ 流式三件套 `spawn_teammate_thread.run:1823` / `spawn_subagent:2691` ↔ `accumulate_stream:3616`
+      ⑵ 注册表晚绑定 `spawn_subagent:2708` × `TOOL_REGISTRY:3176` × `assemble_tool_pool:3126`
+- [ ] **模块级状态**：`_trace_events` / `session_context` 等拆开后归谁
+      ⚠️ **2026-08-20 更正符号名**：代码里是 `HOOKS`(:804) 与 `TOOL_REGISTRY`(:3176)，
+      **不存在** `_hooks` / `registry` —— 原记载系凭印象所写，未经核对。
+- [ ] 🔴 **拆包最大的真实风险（探针新发现，原 backlog 未记）**：`sandbox` fixture
+      （`conftest.py:26-42`）靠 `monkeypatch.setattr(trunk, "TASKS_DIR", ...)` 换模块全局做隔离，
+      其前提是「函数与被 patch 的名字在同一个模块对象上」。拆包后若用 `from pkg import *` 做 facade，
+      **patch 打在 facade 的影子绑定上，函数仍读原模块** —— 已构造最小用例实证：
+      patch 设成 `/tmp/sandboxed/.memory`，函数看到的仍是 `/real/memory`。
+      **后果不是测试变红，是测试静默通过并打到真实目录**，45 个用 sandbox 的测试隔离全失效。
+- [ ] **`tests/conftest.py`** 现在用 `importlib` 按路径装单文件，**139 条**测试全挂在这个 fixture 上（原写 100，已随测试增长更正）
 - [ ] **bench 三个脚本**：`agent_runner.py`（`TARGET = "22_trunk.py"`）、`run_bench.py`、`sandbox_demo.py`
 - [ ] ⚠️ **溯源**：`STAGE2/STAGE3_NOTES` 全部标注「被测 = 22_trunk.py」，225 单元的数据挂在这个名字上
 - [ ] ⚠️ **基准关系**：`21_mcp_real.py` 是课程原状基准，22 是它的「可 import 副本」，拆包会切断这层对照
