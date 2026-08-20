@@ -154,6 +154,14 @@ finally:
     #    合成一个总数就再也拆不开了。
     _trace["tokens_loop"] = dict(getattr(m, "TOKEN_USAGE", {}))
     _trace["tokens_aux"] = dict(_aux)
+    sub = getattr(m, "SUBAGENT_TOKEN_USAGE", None)
+    if isinstance(sub, dict) and sub.get("measured_calls"):
+        _trace["tokens_subagent"] = sub.get("total")
+        _trace["tokens_subagent_detail"] = dict(sub)
+    else:
+        # API 没返回 usage 时记 null,不得伪造 0
+        _trace["tokens_subagent"] = None
+        _trace["tokens_subagent_detail"] = dict(sub) if isinstance(sub, dict) else None
     cals = [
         e
         for e in getattr(m, "_trace_events", [])
