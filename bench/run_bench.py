@@ -11,6 +11,16 @@
     BENCH_TRIALS=3     每个(臂,题)重复次数
     BENCH_DRY_RUN=1    冒烟模式:不起 agent、不花钱,直接把 solution 拷进考场当"完美考生",
                        几秒钟跑完全链路 —— 用来验发卷/判分/登分/并发本身有没有 bug
+    BENCH_DISABLE_TOOLS=spawn_subagent,load_skill
+                       从工具池摘掉这些工具(off 臂)。空 = 不摘。拼错名字 import 当场炸
+    BENCH_DISABLE_MCP=1
+                       connect_mcp 连不上任何 server
+    BENCH_COPY_SKILLS=0
+                       发卷时不把 skills/ 拷进考场。默认拷,16 道老题行为不变
+    BENCH_SKILLS_DIR=/abs/path
+                       主干扫描技能的目录;t18 on 臂指到宿主技能库(考场外)
+    BENCH_FORCE_COMPACT_AT_TURN=N
+                       第 N 轮(0-based)强制 try_compact(force=True)。不设 = 不强制
 """
 
 import difflib
@@ -27,9 +37,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 HERE = Path(__file__).parent.resolve()  # bench/ 自身,绝对路径地图的锚点
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+from taskmeta import is_diagnostic
+
 TASKS_DIR = HERE / "tasks"
 RUNNER = HERE / "agent_runner.py"
 SKILLS_SRC = HERE.parent / "skills"  # 技能库真身,发卷时要跟着走(见 ① 处)
+# t18 要把规范留在考场外:BENCH_COPY_SKILLS=0 跳过拷贝。默认仍拷,见 should_copy_skills。
 
 # 🔴 2026-08-15 第一次正式跑的教训:原本 300s,实测超时 34/120 = 28%。
 # 根因不是并行拖慢(实测并行下反而更快:t08 单跑 290s vs 并行中位 247s),
@@ -138,6 +153,37 @@ def task_rounds(task_dir: Path) -> list[Path]:
 RESET_MARKER = "reset_between_rounds"
 
 
+def load_task_env(task_dir: Path) -> dict[str, str]:
+    """题目录下可选的 bench.env:只填本任务需要的开关,不覆盖操作员已经 export 的值。
+
+    BENCH_SKILLS_DIR 若是相对路径,相对仓库根目录解析成绝对路径
+    (agent 子进程 cwd 是考场,相对路径会漂)。
+    """
+    path = task_dir / "bench.env"
+    env: dict[str, str] = {}
+    if not path.is_file():
+        return env
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if key == "BENCH_SKILLS_DIR" and val and not Path(val).is_absolute():
+            val = str((HERE.parent / val).resolve())
+        env[key] = val
+    return env
+
+
+def should_copy_skills(task_env: dict[str, str] | None = None) -> bool:
+    """默认拷. 操作员环境变量优先,否则看题目 bench.env,再否则拷。"""
+    if "BENCH_COPY_SKILLS" in os.environ:
+        return os.environ["BENCH_COPY_SKILLS"] != "0"
+    if task_env and "BENCH_COPY_SKILLS" in task_env:
+        return task_env["BENCH_COPY_SKILLS"] != "0"
+    return True
+
+
 def reset_workspace(task_dir: Path, repo: Path) -> None:
     """把考场恢复成原卷,但【保留所有点开头的东西】。
 
@@ -167,7 +213,7 @@ def reset_workspace(task_dir: Path, repo: Path) -> None:
             shutil.copytree(src, dst, ignore=IGNORE_CACHES)
         elif src.name not in ("__pycache__",):
             shutil.copy2(src, dst)
-    if SKILLS_SRC.exists():
+    if should_copy_skills(load_task_env(task_dir)) and SKILLS_SRC.exists():
         shutil.copytree(SKILLS_SRC, repo / "skills", dirs_exist_ok=True)
 
 
@@ -375,17 +421,21 @@ def expected_total(task_dir: Path) -> int:
 
 def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
     """一个考试单元:发卷 → 监考 → 收卷 → 登分。并发安全:只在末尾用锁写共享资源。"""
+    task_env = load_task_env(task_dir)
+    diagnostic = is_diagnostic(task_dir)
     repo = run_dir / name / task_dir.name / f"repo{trial}"
     logs = run_dir / name / task_dir.name / f"logs{trial}"
     shutil.copytree(task_dir / "repo", repo, ignore=IGNORE_CACHES)
     logs.mkdir(parents=True, exist_ok=True)
 
-    # ① 技能库要跟着考场走 —— 主干里 SKILLS_DIR = Path.cwd() / "skills",
+    # ① 技能库要跟着考场走 —— 主干里 SKILLS_DIR 默认 = Path.cwd() / "skills",
     #    而子进程的 cwd 是这份考场副本。不拷的话 _scan_skills() 一进门就
     #    return,SKILL_REGISTRY 空,system prompt 里那段技能清单变成
     #    "(no skills found)" —— 「技能」这一层在 bench 里等于没装。
     #    (2026-08-14 发现的第三个 bug:凡是跟着 cwd 走的东西,换考场就漂移)
-    if SKILLS_SRC.exists():
+    # t18 要把规范留在考场外:COPY_SKILLS=0 跳过这一步,改由 BENCH_SKILLS_DIR
+    # 让 load_skill 从考场外读。默认仍拷,老题不受影响。
+    if should_copy_skills(task_env) and SKILLS_SRC.exists():
         shutil.copytree(SKILLS_SRC, repo / "skills")
 
     timed_out = False
@@ -409,7 +459,11 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
         #    只传 {"MEMORY_MODE": ...} 会把 PATH / HOME 整个抹掉,
         #    子进程连解释器和 .venv 都找不到。
         env = os.environ.copy()
+        for key, val in task_env.items():
+            env.setdefault(key, val)
         env.update(env_patch)
+        if diagnostic:
+            env.setdefault("BENCH_FILE_SNAPSHOT", "1")
         if SANDBOX:
             env["SANDBOX_MODE"] = "docker"
             env["SANDBOX_NETWORK"] = "none"  # 无人看守的批量跑:断网防外泄
@@ -491,6 +545,7 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
         "trial": trial,
         "task": task_dir.name,
         "success": proc2.returncode == 0,
+        "diagnostic_only": diagnostic,
         # 🔴 不再只有布尔:「过了 7/8」和「过了 2/8」在归因上是两回事
         "passed": counts["passed"],
         "total": total,
@@ -520,6 +575,8 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
         "tokens_loop_prompt": trace.get("tokens_loop", {}).get("prompt", 0),
         "tokens_aux": trace.get("tokens_aux", {}).get("total", 0),
         "tokens_aux_prompt": trace.get("tokens_aux", {}).get("prompt", 0),
+        # 子 agent 单独字段。无实测 usage 时为 null,不得当 0。
+        "tokens_subagent": trace.get("tokens_subagent"),
         "aux_calls": trace.get("tokens_aux", {}).get("calls", 0),
         "tokens_total": (
             trace.get("tokens_loop", {}).get("total", 0)
@@ -580,7 +637,9 @@ if not units:
 run_dir.mkdir(parents=True, exist_ok=True)
 # 每题满分几条 —— 由标准答案实跑派生,不写常量(题目加测试时自动跟上)
 # ⚠️ 只给【这一轮真的要跑的】题算,否则冒烟一道题也要陪跑 15 次 pytest。
-EXPECTED = {td.name: expected_total(td) for td in tasks}
+EXPECTED = {
+    td.name: (0 if is_diagnostic(td) else expected_total(td)) for td in tasks
+}
 print(
     f"{'[DRY RUN] ' if DRY_RUN else ''}"
     f"{len(units)} 个单元 = {len(configs)} 臂 × {TRIALS} trial × {len(tasks)} 题,"
@@ -629,9 +688,17 @@ for name in CONFIGS:
     rows = [r for r in results if r["config"] == name]
     if not rows:
         continue
-    n = len(rows)
+    scored = [r for r in rows if not r.get("diagnostic_only")]
+    diag_n = len(rows) - len(scored)
+    if not scored:
+        print(
+            f"  {name:14s} diagnostic_only {diag_n} 条，不进通过率"
+        )
+        continue
+    n = len(scored)
+    rows = scored
     full = sum(1 for r in rows if r["success"])
-    avg = lambda k: sum(r[k] for r in rows) / n
+    avg = lambda k: sum(r[k] for r in rows) / n  # noqa: E731
     print(
         f"  {name:14s} 全过 {full}/{n}   "
         f"平均通过率 {avg('pass_rate'):.2f}   "
@@ -644,6 +711,7 @@ for name in CONFIGS:
         f"/{avg('aux_calls'):.1f} 次调用) "
         f"cached {avg('tokens_cached'):.0f}"
         f"/{avg('tokens_loop_prompt') + avg('tokens_aux_prompt'):.0f} prompt"
+        + (f"  （另 {diag_n} 条 diagnostic_only 未计入）" if diag_n else "")
     )
 
 bad = [r for r in results if r["tests_tampered"]]

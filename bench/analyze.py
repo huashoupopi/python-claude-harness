@@ -37,7 +37,19 @@ TIMEOUT_ALARM = 0.10  # 超时率超过这个数,整批数据的可信度就要�
 
 
 def load(path: Path) -> list[dict]:
-    return [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
+    rows = [
+        json.loads(x)
+        for x in path.read_text(encoding="utf-8").splitlines()
+        if x.strip()
+    ]
+    diag = [r for r in rows if r.get("diagnostic_only")]
+    scored = [r for r in rows if not r.get("diagnostic_only")]
+    if diag:
+        print(
+            f"（已从通过率分母剔除 {len(diag)} 条 diagnostic_only："
+            f"{sorted({r['task'] for r in diag})}）"
+        )
+    return scored
 
 
 def split_timeouts(rows: list[dict]) -> tuple[list[dict], list[dict]]:

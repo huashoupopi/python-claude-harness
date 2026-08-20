@@ -68,7 +68,10 @@ MAILBOX_DIR = WORKDIR / ".mailboxes"
 WORKTREES_DIR = WORKDIR / ".worktrees"
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
-SKILLS_DIR = WORKDIR / "skills"
+# 默认跟着 cwd。bench t18 把规范留在考场外时,用 BENCH_SKILLS_DIR 指到宿主技能库,
+# 这样 load_skill 仍能读,但考场内没有 skills/、bash/read_file 够不着正文。
+_skills_dir_raw = os.getenv("BENCH_SKILLS_DIR")
+SKILLS_DIR = Path(_skills_dir_raw) if _skills_dir_raw else (WORKDIR / "skills")
 model = os.getenv("MODEL")
 
 CURRENT_TODOS: list = []
@@ -185,6 +188,41 @@ if TODO_MODE not in TODO_MODES:
     # 否则 bench 跑完一整轮才发现「消融臂根本没生效」,数据全废。
     raise ValueError(f"TODO_MODE={TODO_MODE!r} 不合法,只能是 {TODO_MODES} 之一")
 
+# ---------------------------------------------------------------------------
+# bench 反事实对照开关(2026-08-21 题库拓宽)。全部默认关闭,关闭时行为与加开关前一致。
+# 只在跑批 off 臂时显式打开 —— 用来证明「不用该能力就做不完」,不是生产配置。
+# ---------------------------------------------------------------------------
+
+
+def _parse_csv_names(raw: str) -> tuple[str, ...]:
+    return tuple(s.strip() for s in raw.split(",") if s.strip())
+
+
+def _parse_optional_nonneg_int(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        val = int(raw)
+    except ValueError:
+        raise ValueError(f"{name}={raw!r} 必须是非负整数") from None
+    if val < 0:
+        raise ValueError(f"{name}={raw!r} 必须是非负整数")
+    return val
+
+
+# 从工具池摘掉名单上的工具。空 = 不摘。拼错名字在 TOOL_REGISTRY 填完后 fail loud。
+DISABLE_TOOLS: tuple[str, ...] = _parse_csv_names(os.getenv("BENCH_DISABLE_TOOLS", ""))
+# 1 = connect_mcp 连不上任何 server(mock / stdio 都不开)。默认关。
+BENCH_DISABLE_MCP: bool = os.getenv("BENCH_DISABLE_MCP", "0") == "1"
+# 在指定轮次(0-based,与 agent_loop 的 turn 一致)强制 try_compact(force=True)。
+# 未设置时每轮仍走原来的 try_compact(force=False),多一次 `is not None` 判断。
+BENCH_FORCE_COMPACT_AT_TURN: int | None = _parse_optional_nonneg_int(
+    "BENCH_FORCE_COMPACT_AT_TURN"
+)
+# P2：轮末把考场文件树记进 trace。默认关，关闭时零开销。
+BENCH_FILE_SNAPSHOT: bool = os.getenv("BENCH_FILE_SNAPSHOT", "0") == "1"
+
 # 【2026-08-14 删除 ESCALATED_MAX_TOKENS = 64000】
 # 13_error_recovery.py 的截断处置是两级:①升档重来(8000→64000,丢掉半截重新生成)
 # ②保留 + 续写。本主干是【流式】的,半截输出已经一个字一个字打到用户屏幕上了,
@@ -203,6 +241,15 @@ TOKEN_USAGE = {
     "total": 0,
     "cached": 0,
     "cached_reported": 0,
+}
+# 子 agent 单独一本账,⛔ 不混进 TOKEN_USAGE["prompt"]。
+# measured_calls=0 时对外记 null/unmeasured,不得写成 0 冒充「没花钱」。
+SUBAGENT_TOKEN_USAGE = {
+    "prompt": 0,
+    "completion": 0,
+    "total": 0,
+    "calls": 0,
+    "measured_calls": 0,
 }
 
 
@@ -889,23 +936,39 @@ def require_approval(name: str, args: dict, reason: str) -> str | None:
     return None if choice in ("y", "yes") else "Permission denied by user"
 
 
+def _record_permission_denied(name, args, reason: str) -> str:
+    if TRACE_MODE == "on":
+        _trace_events.append(
+            {
+                "kind": "permission_denied",
+                "tool": name,
+                "args": {k: str(v)[:500] for k, v in (args or {}).items()},
+                "reason": reason,
+                "t": time.time(),
+            }
+        )
+    return reason
+
+
 def permission_hook(name, args):
     if name == "bash":
         for pattern in DENY_LIST:
             if pattern in args.get("command", ""):
                 print(f"\n\033[31m⛔ Blocked: '{pattern}'\033[0m")
-                return "Permission denied by deny list"
+                return _record_permission_denied(
+                    name, args, "Permission denied by deny list"
+                )
         for kw in DESTRUCTIVE:
             if kw in args.get("command", ""):
                 denied = require_approval(name, args, "potentially destructive command")
                 if denied:
-                    return denied
+                    return _record_permission_denied(name, args, denied)
     if name in ("write_file", "edit_file"):
         path = args.get("path", "")
         if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
             denied = require_approval(name, args, "writing outside workspace")
             if denied:
-                return denied
+                return _record_permission_denied(name, args, denied)
     return None
 
 
@@ -925,6 +988,33 @@ TRACE_MODE = os.getenv("TRACE_MODE", "on")
 TRACE_DIR = WORKDIR / ".traces"
 _trace_events: list[dict] = []
 _trace_pending: dict[str, float] = {}
+
+
+def _record_file_snapshot(phase: str) -> None:
+    """轮末考场文件树。默认关。点目录和 skills/ 不进快照（跟 bench diff 口径一致）。"""
+    if not BENCH_FILE_SNAPSHOT or TRACE_MODE != "on":
+        return
+    files: list[str] = []
+    try:
+        for p in WORKDIR.rglob("*"):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(WORKDIR)
+            parts = rel.parts
+            if any(part.startswith(".") for part in parts):
+                continue
+            files.append(rel.as_posix())
+    except OSError:
+        return
+    _trace_events.append(
+        {
+            "kind": "file_snapshot",
+            "turn": _current_turn,
+            "phase": phase,
+            "files": sorted(files),
+            "t": time.time(),
+        }
+    )
 
 
 def _harness_version() -> str:
@@ -2736,13 +2826,15 @@ def spawn_subagent(description: str) -> str:
             tool_choice="auto",
             stream=True,
             max_tokens=DEFAULT_MAX_TOKENS,
+            stream_options={"include_usage": True},
         )
-        # 📌 TODO(2026-08-15):子 agent 的 token 没进 TOKEN_USAGE。
-        #    该算 —— 消融比的是「一次任务的总成本」,子 agent 烧的也是同一笔钱。
-        #    但这次先不算:上面那个 create 还没加 stream_options,_usage 拿到的是 None,
-        #    写了也是空转;而 mini-bench 八道题没有一道会触发 spawn_subagent,
-        #    现在补它等于为一条跑不到的路径花时间。等主循环的数据出来再说。
         text, tool_calls, _finish, _usage = accumulate_stream(stream)
+        SUBAGENT_TOKEN_USAGE["calls"] += 1
+        if _usage is not None and getattr(_usage, "prompt_tokens", None) is not None:
+            SUBAGENT_TOKEN_USAGE["measured_calls"] += 1
+            SUBAGENT_TOKEN_USAGE["prompt"] += _usage.prompt_tokens
+            SUBAGENT_TOKEN_USAGE["completion"] += getattr(_usage, "completion_tokens", 0) or 0
+            SUBAGENT_TOKEN_USAGE["total"] += getattr(_usage, "total_tokens", 0) or 0
         _record_token_calibration(messages, _usage)
         messages.append(build_message(text, tool_calls))
         calls = [tc for _, tc in sorted(tool_calls.items())]
@@ -3086,15 +3178,45 @@ class MCPStdioClient:
 
 REAL_SERVERS = {"weather": [sys.executable, "toy_mcp_server.py"]}
 
+
+class QuotaItemArgs(BaseModel):
+    item: str = Field(..., description="item name whose production quota to look up")
+
+
+def _mock_server_quota():
+    """bench t19 用。限额数字只存在这里(进程内),不进考场、不进 prompt。"""
+
+    def get_limit(item: str) -> str:
+        if item == "widget":
+            return "[quota] widget limit=18427"
+        return f"[quota] unknown item {item}"
+
+    client = MCPClient("quota")
+    client.register(
+        tool_defs=[
+            {
+                "name": "get_limit",
+                "description": "Look up the production quota limit for an item. (readOnly)",
+                "inputSchema": QuotaItemArgs.model_json_schema(),
+            }
+        ],
+        handlers={"get_limit": get_limit},
+    )
+    return client
+
+
 MOCK_SERVERS = {
     "docs": _mock_server_docs,
     "deploy": _mock_server_deploy,
+    "quota": _mock_server_quota,
 }
 
 mcp_clients: dict[str, MCPClient | MCPStdioClient] = {}
 
 
 def connect_mcp_name(name: str) -> str:
+    if BENCH_DISABLE_MCP:
+        return "Error: MCP disabled (BENCH_DISABLE_MCP=1)"
     if name in mcp_clients:
         return f"MCP server '{name}' already exists"
     factory = MOCK_SERVERS.get(name)
@@ -3129,6 +3251,8 @@ def assemble_tool_pool() -> dict:
         tools.pop("memory", None)
     if TODO_MODE == "none":
         tools.pop("todo_write", None)
+    for name in DISABLE_TOOLS:
+        tools.pop(name, None)
     for server_name, mcp_client in mcp_clients.items():
         safe_server = normalize_mcp_name(server_name)
         for tool_def in mcp_client.tools:
@@ -3305,6 +3429,13 @@ TOOL_REGISTRY = {
         spawn_subagent,
     ),
 }
+
+_unknown_disabled = [n for n in DISABLE_TOOLS if n not in TOOL_REGISTRY]
+if _unknown_disabled:
+    raise ValueError(
+        f"BENCH_DISABLE_TOOLS 含未知工具名 {_unknown_disabled}, "
+        f"只能是 TOOL_REGISTRY 里的名字"
+    )
 
 # TOOLS = [
 #     {
@@ -3805,7 +3936,13 @@ def agent_loop(messages: list, context: dict):
         cb, nb = _chars_of(messages), len(messages)
         messages[:] = micro_compact(messages)  # L2: old result placeholders
         _record_compact_event("L2", "old_tool_results", cb, nb, messages)
-        try_compact(messages)  # L4: summarize if too large
+        try_compact(
+            messages,
+            force=(
+                BENCH_FORCE_COMPACT_AT_TURN is not None
+                and turn == BENCH_FORCE_COMPACT_AT_TURN
+            ),
+        )  # L4: summarize if too large; bench 可在指定轮次强制走 force=True
         if TODO_MODE == "nudge" and rounds_since_todo >= 3 and messages:
             messages.append(
                 {"role": "user", "content": "<reminder>Update your todos.</reminder>"}
@@ -3867,6 +4004,7 @@ def agent_loop(messages: list, context: dict):
             messages.append(
                 {"role": "assistant", "content": f"[Error] {type(e).__name__}: {e}"}
             )
+            _record_file_snapshot("turn_end")
             return context
         # msg = reps.choices[0].message
         # messages.append(msg.model_dump(exclude_none=True))
@@ -3882,11 +4020,13 @@ def agent_loop(messages: list, context: dict):
                 )
                 continue
             print("  \033[31m[max_tokens] recovery limit reached\033[0m")
+            _record_file_snapshot("turn_end")
             return context
         msg = build_message(text, tool_calls)
         messages.append(msg)
         calls = [tc for _, tc in sorted(tool_calls.items())]
         if not calls:
+            _record_file_snapshot("turn_end")
             trigger_hook("Stop", messages)
             if MEMORY_MODE == "self":
                 extract_memories(pre_compress)
@@ -3981,7 +4121,9 @@ def agent_loop(messages: list, context: dict):
         context = update_context(context, messages)
         system = assemble_system_prompt(context)
         messages[0] = {**messages[0], "content": system}
+        _record_file_snapshot("turn_end")
     print("达到最大轮次")
+    _record_file_snapshot("turn_end")
     trigger_hook("Stop", messages)
     # 【有意】不在这个出口提取记忆(对照上面 if not calls 那个出口),三条理由:
     #   ① 跑满 max_turns 通常意味着任务卡住了(模型打转/工具一直报错),

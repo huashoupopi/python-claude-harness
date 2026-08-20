@@ -154,6 +154,14 @@ finally:
     #    合成一个总数就再也拆不开了。
     _trace["tokens_loop"] = dict(getattr(m, "TOKEN_USAGE", {}))
     _trace["tokens_aux"] = dict(_aux)
+    sub = getattr(m, "SUBAGENT_TOKEN_USAGE", None)
+    if isinstance(sub, dict) and sub.get("measured_calls"):
+        _trace["tokens_subagent"] = sub.get("total")
+        _trace["tokens_subagent_detail"] = dict(sub)
+    else:
+        # API 没返回 usage 时记 null,不得伪造 0
+        _trace["tokens_subagent"] = None
+        _trace["tokens_subagent_detail"] = dict(sub) if isinstance(sub, dict) else None
     cals = [
         e
         for e in getattr(m, "_trace_events", [])
@@ -162,6 +170,20 @@ finally:
     _trace["token_calibration"] = cals
     if hasattr(m, "summarize_token_calibration"):
         _trace["token_estimate"] = m.summarize_token_calibration(cals)
+    events = [
+        e
+        for e in getattr(m, "_trace_events", [])
+        if isinstance(e, dict)
+    ]
+    _trace["harness_events"] = events
+    hist = getattr(m, "session_history", None) or []
+    final = ""
+    for msg in reversed(hist):
+        if msg.get("role") == "assistant":
+            content = msg.get("content") or ""
+            final = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            break
+    _trace["final_assistant"] = final
     # finally:超时被 kill 之外的任何退出路径都要留下轨迹 ——
     # 崩溃那次的轨迹恰恰最该看(㉚:success 会骗人,只有轨迹说实话)
     TRACE_PATH.write_text(json.dumps(_trace, ensure_ascii=False), encoding="utf-8")
