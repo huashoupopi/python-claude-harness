@@ -37,6 +37,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 HERE = Path(__file__).parent.resolve()  # bench/ 自身,绝对路径地图的锚点
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+from taskmeta import is_diagnostic
+
 TASKS_DIR = HERE / "tasks"
 RUNNER = HERE / "agent_runner.py"
 SKILLS_SRC = HERE.parent / "skills"  # 技能库真身,发卷时要跟着走(见 ① 处)
@@ -418,6 +422,7 @@ def expected_total(task_dir: Path) -> int:
 def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
     """一个考试单元:发卷 → 监考 → 收卷 → 登分。并发安全:只在末尾用锁写共享资源。"""
     task_env = load_task_env(task_dir)
+    diagnostic = is_diagnostic(task_dir)
     repo = run_dir / name / task_dir.name / f"repo{trial}"
     logs = run_dir / name / task_dir.name / f"logs{trial}"
     shutil.copytree(task_dir / "repo", repo, ignore=IGNORE_CACHES)
@@ -457,6 +462,8 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
         for key, val in task_env.items():
             env.setdefault(key, val)
         env.update(env_patch)
+        if diagnostic:
+            env.setdefault("BENCH_FILE_SNAPSHOT", "1")
         if SANDBOX:
             env["SANDBOX_MODE"] = "docker"
             env["SANDBOX_NETWORK"] = "none"  # 无人看守的批量跑:断网防外泄
@@ -538,6 +545,7 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
         "trial": trial,
         "task": task_dir.name,
         "success": proc2.returncode == 0,
+        "diagnostic_only": diagnostic,
         # 🔴 不再只有布尔:「过了 7/8」和「过了 2/8」在归因上是两回事
         "passed": counts["passed"],
         "total": total,
@@ -629,7 +637,9 @@ if not units:
 run_dir.mkdir(parents=True, exist_ok=True)
 # 每题满分几条 —— 由标准答案实跑派生,不写常量(题目加测试时自动跟上)
 # ⚠️ 只给【这一轮真的要跑的】题算,否则冒烟一道题也要陪跑 15 次 pytest。
-EXPECTED = {td.name: expected_total(td) for td in tasks}
+EXPECTED = {
+    td.name: (0 if is_diagnostic(td) else expected_total(td)) for td in tasks
+}
 print(
     f"{'[DRY RUN] ' if DRY_RUN else ''}"
     f"{len(units)} 个单元 = {len(configs)} 臂 × {TRIALS} trial × {len(tasks)} 题,"
@@ -678,9 +688,17 @@ for name in CONFIGS:
     rows = [r for r in results if r["config"] == name]
     if not rows:
         continue
-    n = len(rows)
+    scored = [r for r in rows if not r.get("diagnostic_only")]
+    diag_n = len(rows) - len(scored)
+    if not scored:
+        print(
+            f"  {name:14s} diagnostic_only {diag_n} 条，不进通过率"
+        )
+        continue
+    n = len(scored)
+    rows = scored
     full = sum(1 for r in rows if r["success"])
-    avg = lambda k: sum(r[k] for r in rows) / n
+    avg = lambda k: sum(r[k] for r in rows) / n  # noqa: E731
     print(
         f"  {name:14s} 全过 {full}/{n}   "
         f"平均通过率 {avg('pass_rate'):.2f}   "
@@ -693,6 +711,7 @@ for name in CONFIGS:
         f"/{avg('aux_calls'):.1f} 次调用) "
         f"cached {avg('tokens_cached'):.0f}"
         f"/{avg('tokens_loop_prompt') + avg('tokens_aux_prompt'):.0f} prompt"
+        + (f"  （另 {diag_n} 条 diagnostic_only 未计入）" if diag_n else "")
     )
 
 bad = [r for r in results if r["tests_tampered"]]

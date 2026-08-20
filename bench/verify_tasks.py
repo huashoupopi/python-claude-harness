@@ -23,6 +23,10 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).parent.resolve()
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+from taskmeta import is_diagnostic
+
 TASKS_DIR = HERE / "tasks"
 # 🔴 2026-08-15:发卷/判分一律排除字节码缓存。
 # 踩过的坑:copytree 把原卷的 __pycache__ 一起拷进考场,而 shutil.copy2 覆盖 .py 时
@@ -69,6 +73,9 @@ for task_dir in sorted(TASKS_DIR.iterdir()):
     if not task_dir.is_dir():
         continue
     name = task_dir.name
+    if is_diagnostic(task_dir):
+        print(f"{name:24s} ⏭ diagnostic_only，跳过双头验")
+        continue
     sol_dir = task_dir / "solution"
 
     # 🔴 原题连判 REPEATS 次:每次都是【新进程】,所以哈希种子不同。

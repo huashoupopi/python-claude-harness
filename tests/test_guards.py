@@ -111,6 +111,7 @@ def test_defaults_preserve_pre_switch_behavior(monkeypatch):
     monkeypatch.delenv("BENCH_DISABLE_MCP", raising=False)
     monkeypatch.delenv("BENCH_FORCE_COMPACT_AT_TURN", raising=False)
     monkeypatch.delenv("BENCH_SKILLS_DIR", raising=False)
+    monkeypatch.delenv("BENCH_FILE_SNAPSHOT", raising=False)
     spec = importlib.util.spec_from_file_location("trunk_fresh", TRUNK_PATH)
     fresh = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fresh)
@@ -120,6 +121,7 @@ def test_defaults_preserve_pre_switch_behavior(monkeypatch):
     assert fresh.DISABLE_TOOLS == ()
     assert fresh.BENCH_DISABLE_MCP is False
     assert fresh.BENCH_FORCE_COMPACT_AT_TURN is None
+    assert fresh.BENCH_FILE_SNAPSHOT is False
     assert fresh.SKILLS_DIR == fresh.WORKDIR / "skills"
 
 
