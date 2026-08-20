@@ -40,8 +40,7 @@ HERE = Path(__file__).parent.resolve()  # bench/ 自身,绝对路径地图的锚
 TASKS_DIR = HERE / "tasks"
 RUNNER = HERE / "agent_runner.py"
 SKILLS_SRC = HERE.parent / "skills"  # 技能库真身,发卷时要跟着走(见 ① 处)
-# t18 要把规范留在考场外:BENCH_COPY_SKILLS=0 跳过拷贝。默认 1,16 道老题行为不变。
-COPY_SKILLS = os.getenv("BENCH_COPY_SKILLS", "1") != "0"
+# t18 要把规范留在考场外:BENCH_COPY_SKILLS=0 跳过拷贝。默认仍拷,见 should_copy_skills。
 
 # 🔴 2026-08-15 第一次正式跑的教训:原本 300s,实测超时 34/120 = 28%。
 # 根因不是并行拖慢(实测并行下反而更快:t08 单跑 290s vs 并行中位 247s),
@@ -150,6 +149,37 @@ def task_rounds(task_dir: Path) -> list[Path]:
 RESET_MARKER = "reset_between_rounds"
 
 
+def load_task_env(task_dir: Path) -> dict[str, str]:
+    """题目录下可选的 bench.env:只填本任务需要的开关,不覆盖操作员已经 export 的值。
+
+    BENCH_SKILLS_DIR 若是相对路径,相对仓库根目录解析成绝对路径
+    (agent 子进程 cwd 是考场,相对路径会漂)。
+    """
+    path = task_dir / "bench.env"
+    env: dict[str, str] = {}
+    if not path.is_file():
+        return env
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if key == "BENCH_SKILLS_DIR" and val and not Path(val).is_absolute():
+            val = str((HERE.parent / val).resolve())
+        env[key] = val
+    return env
+
+
+def should_copy_skills(task_env: dict[str, str] | None = None) -> bool:
+    """默认拷. 操作员环境变量优先,否则看题目 bench.env,再否则拷。"""
+    if "BENCH_COPY_SKILLS" in os.environ:
+        return os.environ["BENCH_COPY_SKILLS"] != "0"
+    if task_env and "BENCH_COPY_SKILLS" in task_env:
+        return task_env["BENCH_COPY_SKILLS"] != "0"
+    return True
+
+
 def reset_workspace(task_dir: Path, repo: Path) -> None:
     """把考场恢复成原卷,但【保留所有点开头的东西】。
 
@@ -179,7 +209,7 @@ def reset_workspace(task_dir: Path, repo: Path) -> None:
             shutil.copytree(src, dst, ignore=IGNORE_CACHES)
         elif src.name not in ("__pycache__",):
             shutil.copy2(src, dst)
-    if COPY_SKILLS and SKILLS_SRC.exists():
+    if should_copy_skills(load_task_env(task_dir)) and SKILLS_SRC.exists():
         shutil.copytree(SKILLS_SRC, repo / "skills", dirs_exist_ok=True)
 
 
@@ -387,6 +417,7 @@ def expected_total(task_dir: Path) -> int:
 
 def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
     """一个考试单元:发卷 → 监考 → 收卷 → 登分。并发安全:只在末尾用锁写共享资源。"""
+    task_env = load_task_env(task_dir)
     repo = run_dir / name / task_dir.name / f"repo{trial}"
     logs = run_dir / name / task_dir.name / f"logs{trial}"
     shutil.copytree(task_dir / "repo", repo, ignore=IGNORE_CACHES)
@@ -399,7 +430,7 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
     #    (2026-08-14 发现的第三个 bug:凡是跟着 cwd 走的东西,换考场就漂移)
     # t18 要把规范留在考场外:COPY_SKILLS=0 跳过这一步,改由 BENCH_SKILLS_DIR
     # 让 load_skill 从考场外读。默认仍拷,老题不受影响。
-    if COPY_SKILLS and SKILLS_SRC.exists():
+    if should_copy_skills(task_env) and SKILLS_SRC.exists():
         shutil.copytree(SKILLS_SRC, repo / "skills")
 
     timed_out = False
@@ -423,6 +454,8 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
         #    只传 {"MEMORY_MODE": ...} 会把 PATH / HOME 整个抹掉,
         #    子进程连解释器和 .venv 都找不到。
         env = os.environ.copy()
+        for key, val in task_env.items():
+            env.setdefault(key, val)
         env.update(env_patch)
         if SANDBOX:
             env["SANDBOX_MODE"] = "docker"
@@ -534,6 +567,8 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
         "tokens_loop_prompt": trace.get("tokens_loop", {}).get("prompt", 0),
         "tokens_aux": trace.get("tokens_aux", {}).get("total", 0),
         "tokens_aux_prompt": trace.get("tokens_aux", {}).get("prompt", 0),
+        # 子 agent 单独字段。无实测 usage 时为 null,不得当 0。
+        "tokens_subagent": trace.get("tokens_subagent"),
         "aux_calls": trace.get("tokens_aux", {}).get("calls", 0),
         "tokens_total": (
             trace.get("tokens_loop", {}).get("total", 0)

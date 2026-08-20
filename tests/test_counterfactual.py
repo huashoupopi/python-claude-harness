@@ -7,8 +7,6 @@
 
 import importlib.util
 
-import pytest
-
 from tests.test_guards import TRUNK_PATH
 
 
@@ -74,22 +72,27 @@ def test_skills_dir_override_on_fresh_import(tmp_path, monkeypatch):
     assert not (exam / "skills").exists()
 
 
-def test_copy_skills_default_is_on():
-    """老题依赖 skills 进考场。默认必须是拷。"""
-    import os
+def test_should_copy_skills_default_on_without_importing_run_bench(monkeypatch):
+    """老题依赖 skills 进考场。默认必须是拷。
 
-    assert os.getenv("BENCH_COPY_SKILLS", "1") != "0"
-    # 谓词与 run_bench.COPY_SKILLS 同源:未设置时视为拷。
-    assert (os.getenv("BENCH_COPY_SKILLS", "1") != "0") is True
+    不 import run_bench:它在模块级会建 runs/ 目录。把函数源码 exec 出来测谓词。
+    """
+    import ast
+    from pathlib import Path
 
-
-@pytest.mark.parametrize("flag, expect_copy", [("1", True), ("0", False), ("", True)])
-def test_copy_skills_predicate(flag, expect_copy, monkeypatch):
-    if flag == "":
-        monkeypatch.delenv("BENCH_COPY_SKILLS", raising=False)
-    else:
-        monkeypatch.setenv("BENCH_COPY_SKILLS", flag)
-    import os
-
-    copy = os.getenv("BENCH_COPY_SKILLS", "1") != "0"
-    assert copy is expect_copy
+    monkeypatch.delenv("BENCH_COPY_SKILLS", raising=False)
+    src = Path(__file__).parent.parent / "bench" / "run_bench.py"
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+    fn = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "should_copy_skills"
+    )
+    ns: dict = {"os": __import__("os")}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(src), "exec"), ns)
+    should_copy_skills = ns["should_copy_skills"]
+    assert should_copy_skills({}) is True
+    assert should_copy_skills({"BENCH_COPY_SKILLS": "0"}) is False
+    assert should_copy_skills({"BENCH_COPY_SKILLS": "1"}) is True
+    monkeypatch.setenv("BENCH_COPY_SKILLS", "0")
+    assert should_copy_skills({"BENCH_COPY_SKILLS": "1"}) is False  # 操作员优先
