@@ -240,6 +240,15 @@ TOKEN_USAGE = {
     "cached": 0,
     "cached_reported": 0,
 }
+# 子 agent 单独一本账,⛔ 不混进 TOKEN_USAGE["prompt"]。
+# measured_calls=0 时对外记 null/unmeasured,不得写成 0 冒充「没花钱」。
+SUBAGENT_TOKEN_USAGE = {
+    "prompt": 0,
+    "completion": 0,
+    "total": 0,
+    "calls": 0,
+    "measured_calls": 0,
+}
 
 
 def _usage_cached_tokens(usage) -> int:
@@ -2772,13 +2781,15 @@ def spawn_subagent(description: str) -> str:
             tool_choice="auto",
             stream=True,
             max_tokens=DEFAULT_MAX_TOKENS,
+            stream_options={"include_usage": True},
         )
-        # 📌 TODO(2026-08-15):子 agent 的 token 没进 TOKEN_USAGE。
-        #    该算 —— 消融比的是「一次任务的总成本」,子 agent 烧的也是同一笔钱。
-        #    但这次先不算:上面那个 create 还没加 stream_options,_usage 拿到的是 None,
-        #    写了也是空转;而 mini-bench 八道题没有一道会触发 spawn_subagent,
-        #    现在补它等于为一条跑不到的路径花时间。等主循环的数据出来再说。
         text, tool_calls, _finish, _usage = accumulate_stream(stream)
+        SUBAGENT_TOKEN_USAGE["calls"] += 1
+        if _usage is not None and getattr(_usage, "prompt_tokens", None) is not None:
+            SUBAGENT_TOKEN_USAGE["measured_calls"] += 1
+            SUBAGENT_TOKEN_USAGE["prompt"] += _usage.prompt_tokens
+            SUBAGENT_TOKEN_USAGE["completion"] += getattr(_usage, "completion_tokens", 0) or 0
+            SUBAGENT_TOKEN_USAGE["total"] += getattr(_usage, "total_tokens", 0) or 0
         _record_token_calibration(messages, _usage)
         messages.append(build_message(text, tool_calls))
         calls = [tc for _, tc in sorted(tool_calls.items())]
@@ -3122,9 +3133,37 @@ class MCPStdioClient:
 
 REAL_SERVERS = {"weather": [sys.executable, "toy_mcp_server.py"]}
 
+
+class QuotaItemArgs(BaseModel):
+    item: str = Field(..., description="item name whose production quota to look up")
+
+
+def _mock_server_quota():
+    """bench t19 用。限额数字只存在这里(进程内),不进考场、不进 prompt。"""
+
+    def get_limit(item: str) -> str:
+        if item == "widget":
+            return "[quota] widget limit=18427"
+        return f"[quota] unknown item {item}"
+
+    client = MCPClient("quota")
+    client.register(
+        tool_defs=[
+            {
+                "name": "get_limit",
+                "description": "Look up the production quota limit for an item. (readOnly)",
+                "inputSchema": QuotaItemArgs.model_json_schema(),
+            }
+        ],
+        handlers={"get_limit": get_limit},
+    )
+    return client
+
+
 MOCK_SERVERS = {
     "docs": _mock_server_docs,
     "deploy": _mock_server_deploy,
+    "quota": _mock_server_quota,
 }
 
 mcp_clients: dict[str, MCPClient | MCPStdioClient] = {}
