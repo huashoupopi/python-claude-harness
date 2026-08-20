@@ -450,6 +450,66 @@ def test_l2_snip_emits_compact_event_in_agent_loop(sandbox, monkeypatch):
     assert "L3" not in layers  # 合计远低于 200_000,L3 不应出手
 
 
+def test_force_compact_at_turn_zero_records_force_reason(sandbox, monkeypatch):
+    """BENCH_FORCE_COMPACT_AT_TURN=0:第一轮必须走 try_compact(force=True),trace reason=force。
+
+    默认关时短对话不会 compact(见 test_default_limit_does_not_compact_small_history)。
+    打开后即使远低于阈值也要出手 —— 这是 t20 注入点的全部意义。
+    """
+    monkeypatch.setattr(sandbox, "BENCH_FORCE_COMPACT_AT_TURN", 0)
+    monkeypatch.setattr(sandbox, "MEMORY_MODE", "none")
+    monkeypatch.setattr(sandbox, "TODO_MODE", "none")
+    monkeypatch.setattr(sandbox, "TRACE_MODE", "on")
+    monkeypatch.setattr(sandbox, "_trace_events", [])
+    monkeypatch.setattr(sandbox, "compact_failures", 0)
+    called = []
+
+    def fake_hist(msgs):
+        called.append(len(msgs))
+        return [{"role": "user", "content": "[Compacted]\n\nstub"}]
+
+    monkeypatch.setattr(sandbox, "compact_history", fake_hist)
+    monkeypatch.setattr(
+        sandbox.client.chat.completions,
+        "create",
+        lambda **kwargs: iter([_text_chunk("done")]),
+    )
+    msgs = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "hi"},
+    ]
+    sandbox.agent_loop(msgs, {})
+    assert called, "指定轮次没有强制 compact"
+    events = [
+        e
+        for e in sandbox._trace_events
+        if e.get("kind") == "compact" and e.get("reason") == "force"
+    ]
+    assert events, "出手了但 trace 没有 reason=force 的 compact 事件"
+
+
+def test_force_compact_unset_does_not_summarize_short_history(sandbox, monkeypatch):
+    """关闭时零开销:短对话不得因为开关的存在而走进 compact_history。"""
+    monkeypatch.setattr(sandbox, "BENCH_FORCE_COMPACT_AT_TURN", None)
+    monkeypatch.setattr(sandbox, "MEMORY_MODE", "none")
+    monkeypatch.setattr(sandbox, "TODO_MODE", "none")
+    called = []
+    monkeypatch.setattr(
+        sandbox, "compact_history", lambda msgs: called.append(1) or msgs[1:]
+    )
+    monkeypatch.setattr(
+        sandbox.client.chat.completions,
+        "create",
+        lambda **kwargs: iter([_text_chunk("done")]),
+    )
+    msgs = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "hi"},
+    ]
+    sandbox.agent_loop(msgs, {})
+    assert called == []
+
+
 def test_trace_view_shows_compact_event(tmp_path, capsys, monkeypatch):
     """彩色视图必须把 compact 事件画出来,不能当成缺 tool 名的调用崩掉。"""
     import importlib.util

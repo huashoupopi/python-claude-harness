@@ -68,7 +68,10 @@ MAILBOX_DIR = WORKDIR / ".mailboxes"
 WORKTREES_DIR = WORKDIR / ".worktrees"
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
-SKILLS_DIR = WORKDIR / "skills"
+# 默认跟着 cwd。bench t18 把规范留在考场外时,用 BENCH_SKILLS_DIR 指到宿主技能库,
+# 这样 load_skill 仍能读,但考场内没有 skills/、bash/read_file 够不着正文。
+_skills_dir_raw = os.getenv("BENCH_SKILLS_DIR")
+SKILLS_DIR = Path(_skills_dir_raw) if _skills_dir_raw else (WORKDIR / "skills")
 model = os.getenv("MODEL")
 
 CURRENT_TODOS: list = []
@@ -184,6 +187,39 @@ if TODO_MODE not in TODO_MODES:
     # fail loud:配置错了当场炸,不要静默退回默认值 ——
     # 否则 bench 跑完一整轮才发现「消融臂根本没生效」,数据全废。
     raise ValueError(f"TODO_MODE={TODO_MODE!r} 不合法,只能是 {TODO_MODES} 之一")
+
+# ---------------------------------------------------------------------------
+# bench 反事实对照开关(2026-08-21 题库拓宽)。全部默认关闭,关闭时行为与加开关前一致。
+# 只在跑批 off 臂时显式打开 —— 用来证明「不用该能力就做不完」,不是生产配置。
+# ---------------------------------------------------------------------------
+
+
+def _parse_csv_names(raw: str) -> tuple[str, ...]:
+    return tuple(s.strip() for s in raw.split(",") if s.strip())
+
+
+def _parse_optional_nonneg_int(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        val = int(raw)
+    except ValueError:
+        raise ValueError(f"{name}={raw!r} 必须是非负整数") from None
+    if val < 0:
+        raise ValueError(f"{name}={raw!r} 必须是非负整数")
+    return val
+
+
+# 从工具池摘掉名单上的工具。空 = 不摘。拼错名字在 TOOL_REGISTRY 填完后 fail loud。
+DISABLE_TOOLS: tuple[str, ...] = _parse_csv_names(os.getenv("BENCH_DISABLE_TOOLS", ""))
+# 1 = connect_mcp 连不上任何 server(mock / stdio 都不开)。默认关。
+BENCH_DISABLE_MCP: bool = os.getenv("BENCH_DISABLE_MCP", "0") == "1"
+# 在指定轮次(0-based,与 agent_loop 的 turn 一致)强制 try_compact(force=True)。
+# 未设置时每轮仍走原来的 try_compact(force=False),多一次 `is not None` 判断。
+BENCH_FORCE_COMPACT_AT_TURN: int | None = _parse_optional_nonneg_int(
+    "BENCH_FORCE_COMPACT_AT_TURN"
+)
 
 # 【2026-08-14 删除 ESCALATED_MAX_TOKENS = 64000】
 # 13_error_recovery.py 的截断处置是两级:①升档重来(8000→64000,丢掉半截重新生成)
@@ -3095,6 +3131,8 @@ mcp_clients: dict[str, MCPClient | MCPStdioClient] = {}
 
 
 def connect_mcp_name(name: str) -> str:
+    if BENCH_DISABLE_MCP:
+        return "Error: MCP disabled (BENCH_DISABLE_MCP=1)"
     if name in mcp_clients:
         return f"MCP server '{name}' already exists"
     factory = MOCK_SERVERS.get(name)
@@ -3129,6 +3167,8 @@ def assemble_tool_pool() -> dict:
         tools.pop("memory", None)
     if TODO_MODE == "none":
         tools.pop("todo_write", None)
+    for name in DISABLE_TOOLS:
+        tools.pop(name, None)
     for server_name, mcp_client in mcp_clients.items():
         safe_server = normalize_mcp_name(server_name)
         for tool_def in mcp_client.tools:
@@ -3305,6 +3345,13 @@ TOOL_REGISTRY = {
         spawn_subagent,
     ),
 }
+
+_unknown_disabled = [n for n in DISABLE_TOOLS if n not in TOOL_REGISTRY]
+if _unknown_disabled:
+    raise ValueError(
+        f"BENCH_DISABLE_TOOLS 含未知工具名 {_unknown_disabled}, "
+        f"只能是 TOOL_REGISTRY 里的名字"
+    )
 
 # TOOLS = [
 #     {
@@ -3805,7 +3852,13 @@ def agent_loop(messages: list, context: dict):
         cb, nb = _chars_of(messages), len(messages)
         messages[:] = micro_compact(messages)  # L2: old result placeholders
         _record_compact_event("L2", "old_tool_results", cb, nb, messages)
-        try_compact(messages)  # L4: summarize if too large
+        try_compact(
+            messages,
+            force=(
+                BENCH_FORCE_COMPACT_AT_TURN is not None
+                and turn == BENCH_FORCE_COMPACT_AT_TURN
+            ),
+        )  # L4: summarize if too large; bench 可在指定轮次强制走 force=True
         if TODO_MODE == "nudge" and rounds_since_todo >= 3 and messages:
             messages.append(
                 {"role": "user", "content": "<reminder>Update your todos.</reminder>"}

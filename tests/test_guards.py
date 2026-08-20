@@ -107,12 +107,20 @@ def test_defaults_preserve_pre_switch_behavior(monkeypatch):
     """
     monkeypatch.delenv("TODO_MODE", raising=False)
     monkeypatch.delenv("MEMORY_MODE", raising=False)
+    monkeypatch.delenv("BENCH_DISABLE_TOOLS", raising=False)
+    monkeypatch.delenv("BENCH_DISABLE_MCP", raising=False)
+    monkeypatch.delenv("BENCH_FORCE_COMPACT_AT_TURN", raising=False)
+    monkeypatch.delenv("BENCH_SKILLS_DIR", raising=False)
     spec = importlib.util.spec_from_file_location("trunk_fresh", TRUNK_PATH)
     fresh = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fresh)
 
     assert fresh.TODO_MODE == "nudge"  # 加开关前:每三轮催一次
     assert fresh.MEMORY_MODE == "self"  # 加开关前:系统自动提取+注入
+    assert fresh.DISABLE_TOOLS == ()
+    assert fresh.BENCH_DISABLE_MCP is False
+    assert fresh.BENCH_FORCE_COMPACT_AT_TURN is None
+    assert fresh.SKILLS_DIR == fresh.WORKDIR / "skills"
 
 
 def test_illegal_switch_values_fail_loud(monkeypatch):
@@ -131,6 +139,28 @@ def test_illegal_switch_values_fail_loud(monkeypatch):
         else:
             raise AssertionError(f"{var}='bogus' 本该当场炸")
         monkeypatch.delenv(var)
+
+    monkeypatch.setenv("BENCH_DISABLE_TOOLS", "not_a_real_tool")
+    spec = importlib.util.spec_from_file_location("trunk_bogus_tools", TRUNK_PATH)
+    m = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(m)
+    except ValueError as e:
+        assert "not_a_real_tool" in str(e)
+    else:
+        raise AssertionError("未知工具名本该当场炸")
+    monkeypatch.delenv("BENCH_DISABLE_TOOLS")
+
+    monkeypatch.setenv("BENCH_FORCE_COMPACT_AT_TURN", "nope")
+    spec = importlib.util.spec_from_file_location("trunk_bogus_turn", TRUNK_PATH)
+    m = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(m)
+    except ValueError as e:
+        assert "nope" in str(e)
+    else:
+        raise AssertionError("非整数的 FORCE_COMPACT 本该当场炸")
+    monkeypatch.delenv("BENCH_FORCE_COMPACT_AT_TURN")
 
 
 # ---------- 工具执行的兜底(T21 扫描) ----------

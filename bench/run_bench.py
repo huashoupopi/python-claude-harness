@@ -11,6 +11,16 @@
     BENCH_TRIALS=3     每个(臂,题)重复次数
     BENCH_DRY_RUN=1    冒烟模式:不起 agent、不花钱,直接把 solution 拷进考场当"完美考生",
                        几秒钟跑完全链路 —— 用来验发卷/判分/登分/并发本身有没有 bug
+    BENCH_DISABLE_TOOLS=spawn_subagent,load_skill
+                       从工具池摘掉这些工具(off 臂)。空 = 不摘。拼错名字 import 当场炸
+    BENCH_DISABLE_MCP=1
+                       connect_mcp 连不上任何 server
+    BENCH_COPY_SKILLS=0
+                       发卷时不把 skills/ 拷进考场。默认拷,16 道老题行为不变
+    BENCH_SKILLS_DIR=/abs/path
+                       主干扫描技能的目录;t18 on 臂指到宿主技能库(考场外)
+    BENCH_FORCE_COMPACT_AT_TURN=N
+                       第 N 轮(0-based)强制 try_compact(force=True)。不设 = 不强制
 """
 
 import difflib
@@ -30,6 +40,8 @@ HERE = Path(__file__).parent.resolve()  # bench/ 自身,绝对路径地图的锚
 TASKS_DIR = HERE / "tasks"
 RUNNER = HERE / "agent_runner.py"
 SKILLS_SRC = HERE.parent / "skills"  # 技能库真身,发卷时要跟着走(见 ① 处)
+# t18 要把规范留在考场外:BENCH_COPY_SKILLS=0 跳过拷贝。默认 1,16 道老题行为不变。
+COPY_SKILLS = os.getenv("BENCH_COPY_SKILLS", "1") != "0"
 
 # 🔴 2026-08-15 第一次正式跑的教训:原本 300s,实测超时 34/120 = 28%。
 # 根因不是并行拖慢(实测并行下反而更快:t08 单跑 290s vs 并行中位 247s),
@@ -167,7 +179,7 @@ def reset_workspace(task_dir: Path, repo: Path) -> None:
             shutil.copytree(src, dst, ignore=IGNORE_CACHES)
         elif src.name not in ("__pycache__",):
             shutil.copy2(src, dst)
-    if SKILLS_SRC.exists():
+    if COPY_SKILLS and SKILLS_SRC.exists():
         shutil.copytree(SKILLS_SRC, repo / "skills", dirs_exist_ok=True)
 
 
@@ -380,12 +392,14 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
     shutil.copytree(task_dir / "repo", repo, ignore=IGNORE_CACHES)
     logs.mkdir(parents=True, exist_ok=True)
 
-    # ① 技能库要跟着考场走 —— 主干里 SKILLS_DIR = Path.cwd() / "skills",
+    # ① 技能库要跟着考场走 —— 主干里 SKILLS_DIR 默认 = Path.cwd() / "skills",
     #    而子进程的 cwd 是这份考场副本。不拷的话 _scan_skills() 一进门就
     #    return,SKILL_REGISTRY 空,system prompt 里那段技能清单变成
     #    "(no skills found)" —— 「技能」这一层在 bench 里等于没装。
     #    (2026-08-14 发现的第三个 bug:凡是跟着 cwd 走的东西,换考场就漂移)
-    if SKILLS_SRC.exists():
+    # t18 要把规范留在考场外:COPY_SKILLS=0 跳过这一步,改由 BENCH_SKILLS_DIR
+    # 让 load_skill 从考场外读。默认仍拷,老题不受影响。
+    if COPY_SKILLS and SKILLS_SRC.exists():
         shutil.copytree(SKILLS_SRC, repo / "skills")
 
     timed_out = False
