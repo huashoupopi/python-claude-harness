@@ -1003,8 +1003,6 @@ def _record_file_snapshot(phase: str) -> None:
             parts = rel.parts
             if any(part.startswith(".") for part in parts):
                 continue
-            if parts and parts[0] == "skills":
-                continue
             files.append(rel.as_posix())
     except OSError:
         return
