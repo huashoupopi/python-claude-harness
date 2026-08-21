@@ -2,7 +2,7 @@
 # 限额真值只写在本文件与主干 mock 里,不进考场。
 set -e
 cd "$1"
-python - <<'PY'
+"${BENCH_PYTHON:-python}" - <<'PY'
 from quota import allowed
 
 assert allowed(18427) is True, "limit too low: 18427 must be allowed"

@@ -1,3 +1,3 @@
 #!/bin/bash
 cd "$1"
-python -m pytest -q
+"${BENCH_PYTHON:-python}" -m pytest -q

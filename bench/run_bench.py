@@ -80,6 +80,12 @@ run_dir = (
 SANDBOX = os.getenv("BENCH_SANDBOX", "1") == "1"
 DELETIONS = "_deletions.txt"  # solution/ 里的特殊文件,见 verify_tasks.py
 
+# 判分脚本里的解释器不靠 PATH 猜:调用方知道自己跑在哪个 Python 上,直接传过去。
+# 不传时回落到 `python` —— 容器内考场(python:3.13-slim)和 `uv run` 下都有,行为不变。
+# 起因:绕过 uv 直接跑 pytest 时,grade.sh 报 `python: command not found`(exit 127),
+# 而同仓对 docker 依赖是有守卫会 skip 的(test_sandbox.py::_image_ready),这里没有。
+GRADE_ENV = {**os.environ, "BENCH_PYTHON": sys.executable}
+
 # ✅ 2026-08-15 已修(实现在文件末尾「🔒 藏答案」那段):跑之前把 solution/ 移出项目树,
 #    try/finally 还回去。以下是案发记录,保留。
 # 2026-08-15 实测泄漏 2/120:模型做不出题(48 次 write_file 仍不过),掉头去查评测系统,
@@ -415,6 +421,7 @@ def expected_total(task_dir: Path) -> int:
             ["bash", str(task_dir / "grade.sh"), str(repo)],
             capture_output=True,
             text=True,
+            env=GRADE_ENV,
         )
         return parse_pytest(p.stdout + p.stderr)["passed"]
 
@@ -521,7 +528,10 @@ def run_one(name: str, env_patch: dict, trial: int, task_dir: Path) -> dict:
     # 超时的也照样判分:被 kill 之前可能已经把代码改对了,
     # 「没跑完」和「没做对」是两件事,分开记(timed_out 字段)。
     proc2 = subprocess.run(
-        ["bash", str(task_dir / "grade.sh"), str(repo)], capture_output=True, text=True
+        ["bash", str(task_dir / "grade.sh"), str(repo)],
+        capture_output=True,
+        text=True,
+        env=GRADE_ENV,
     )
     counts = parse_pytest(proc2.stdout + proc2.stderr)
     total = EXPECTED[task_dir.name]
