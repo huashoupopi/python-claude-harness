@@ -3,7 +3,7 @@
 # 否则模型读 test_*.py 就能绕过 load_skill。
 set -e
 cd "$1"
-python - <<'PY'
+"${BENCH_PYTHON:-python}" - <<'PY'
 from pathlib import Path
 src = Path("widget.py").read_text(encoding="utf-8")
 assert "def hs_normalize" in src, "missing hs_normalize (house-style names)"
@@ -15,4 +15,4 @@ assert "def normalize(" not in src, "old public name normalize still present"
 assert "def clip(" not in src, "old public name clip still present"
 print("style ok")
 PY
-python -m pytest -q
+"${BENCH_PYTHON:-python}" -m pytest -q

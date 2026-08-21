@@ -3,7 +3,9 @@
 2026-08-21 实跑：中文写对的 AUDIT.md 被 "default" / "is_live" / "float" 误杀。
 """
 
+import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -40,7 +42,12 @@ def _grade(audit: str) -> subprocess.CompletedProcess:
     with tempfile.TemporaryDirectory() as td:
         Path(td, "AUDIT.md").write_text(audit, encoding="utf-8")
         return subprocess.run(
-            ["bash", str(GRADE), td], capture_output=True, text=True, timeout=30
+            ["bash", str(GRADE), td],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            # 解释器显式传,不靠 PATH —— 绕过 uv 直接跑 pytest 时 `python` 可能不存在。
+            env={**os.environ, "BENCH_PYTHON": sys.executable},
         )
 
 

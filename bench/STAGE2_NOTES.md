@@ -187,7 +187,12 @@ todo_calls = 2    模型自己主动用了两次,并列出三条计划
 
 ## 六、待办
 
-- 🔴 **修评测泄漏**：跑之前把 `solution/` 临时改名藏起来（`try/finally` 恢复），检测保留作兜底。**下次开跑前必做。**
+- [x] ~~🔴 **修评测泄漏**：跑之前把 `solution/` 临时改名藏起来（`try/finally` 恢复），检测保留作兜底。~~
+      ✅ **2026-08-15 已做**，实现在 `run_bench.py` 的「🔒 藏答案」段：整个 `solution/` 移出项目树、跑完还回去。
+      三个细节记在那段注释里：`try` 从**藏之前**就开始（搬到第 5 个才出错，前 4 个也得还回去）；
+      只在最外层藏**一次**（`run_one` 是 4 路并发，写进去会互抢同一个目录）；dry-run **不藏**
+      （演习模式拿 solution 当「完美考生」，藏了冒烟闸当场报废）。
+      ⚠️ 本条文字滞后 6 天未划，2026-08-21 补记。
 - **两轮任务题型**：同一考场连跑两个 task，让记忆层真的有机会产生收益——否则 memory 轴永远只能测出成本。
 - **子 agent / teammate 的 token 未计入**（那两处 `create` 还没加 `stream_options`）；本次八题无一触发 `spawn_subagent`，不影响结论。
-- **`reasoning_tokens` 与 `cached_tokens` 未单独分析**。新模型回一个 `OK` 花 18 个 completion token、其中 17 个是推理；prompt 502 里 384 是缓存命中（76%）——**这直接关系到「压缩与 prompt cache 是天敌」，值得单独一轮。**
+- **`reasoning_tokens` 未单独分析**（`cached_tokens` ✅ 已于 **2026-08-19** 补测，见 `STAGE3_NOTES.md` §五之二；实测 `cached 127744 / prompt 233781 = 54.64%`，并从 11 个数字里读出「该端点按 128 token 一块缓存、零头不缓存」）。新模型回一个 `OK` 花 18 个 completion token、其中 17 个是推理；prompt 502 里 384 是缓存命中（76%）——**这直接关系到「压缩与 prompt cache 是天敌」，值得单独一轮。**

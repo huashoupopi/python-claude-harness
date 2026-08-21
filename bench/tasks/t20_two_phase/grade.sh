@@ -4,7 +4,7 @@
 set -e
 cd "$1"
 test -f FINDINGS.md
-python - <<'PY'
+"${BENCH_PYTHON:-python}" - <<'PY'
 from pathlib import Path
 import importlib.util
 

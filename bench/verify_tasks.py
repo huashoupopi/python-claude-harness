@@ -46,12 +46,20 @@ DELETIONS = "_deletions.txt"
 _STRIP_TIME = re.compile(r"\s+in\s+[\d.]+s\s*$")
 
 
+# 判分脚本里的解释器不靠 PATH 猜:调用方知道自己跑在哪个 Python 上,直接传过去。
+# 不传时回落到 `python` —— 容器内考场(python:3.13-slim)和 `uv run` 下都有,行为不变。
+# 起因:绕过 uv 直接跑 pytest 时,grade.sh 报 `python: command not found`(exit 127),
+# 而同仓对 docker 依赖是有守卫会 skip 的(test_sandbox.py::_image_ready),这里没有。
+GRADE_ENV = {**os.environ, "BENCH_PYTHON": sys.executable}
+
+
 def grade(task_dir: Path, repo: Path) -> tuple[bool, str]:
     proc = subprocess.run(
         ["bash", str(task_dir / "grade.sh"), str(repo)],
         capture_output=True,
         text=True,
         timeout=120,
+        env=GRADE_ENV,
     )
     tail = (proc.stdout + proc.stderr).strip().splitlines()
     return proc.returncode == 0, (tail[-1] if tail else "(no output)")

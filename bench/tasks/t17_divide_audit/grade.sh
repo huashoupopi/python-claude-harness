@@ -6,7 +6,7 @@
 set -e
 cd "$1"
 test -f AUDIT.md
-python - <<'PY'
+"${BENCH_PYTHON:-python}" - <<'PY'
 import re
 from pathlib import Path
 
